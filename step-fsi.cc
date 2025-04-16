@@ -1226,12 +1226,10 @@ FSI_PU_DWR_Problem<dim>::setup_system_primal()
                                                mpi_communicator,
                                                locally_relevant_dofs_primal);
 
-    std::cout << "Step 3" << std::endl;
     system_matrix_primal.reinit(locally_owned_dofs_primal,
                                 locally_owned_dofs_primal,
                                 dsp_primal,
                                 mpi_communicator);
-    std::cout << "Step 4" << std::endl;
   }
 
   // Actual solution
@@ -2349,8 +2347,13 @@ FSI_PU_DWR_Problem<dim>::newton_iteration_primal()
       linearization_point = solution_primal;
       old_solution_norm   = linearization_point.linfty_norm();
 
+      pcout << "Old solution norm: " << old_solution_norm << std::endl;
+
+
       assemble_rhs_primal();
       newton_residual = system_rhs_primal.linfty_norm();
+
+      pcout << "Newton residual: " << newton_residual << std::endl;
 
       if (newton_residual < lower_bound_newton_residual ||
           (newton_residual / initial_residual <
@@ -2386,7 +2389,6 @@ FSI_PU_DWR_Problem<dim>::newton_iteration_primal()
             break;
           else
             {
-              // work arround
               linearization_point -= newton_update_primal;
             }
 
@@ -4891,9 +4893,7 @@ FSI_PU_DWR_Problem<dim>::run()
 
   // Initialize degrees of freedom
   setup_system_primal();
-  pcout << "setup system primal: done!" << std::endl;
   setup_system_adjoint();
-  pcout << "setup system adjoint: done!" << std::endl;
 
   pcout << "\n=============================="
         << "=====================================" << std::endl;
