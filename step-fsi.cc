@@ -1180,8 +1180,8 @@ FSI_PU_DWR_Problem<dim>::setup_system_primal()
   block_component[dim + dim] = 2;
 
   // TODO: for the first test we disable the DoFRenumbering
-  //DoFRenumbering::Cuthill_McKee(dof_handler_primal);
-  //DoFRenumbering::component_wise(dof_handler_primal, block_component);
+  // DoFRenumbering::Cuthill_McKee(dof_handler_primal);
+  // DoFRenumbering::component_wise(dof_handler_primal, block_component);
 
   // Get the working index sets:
   // locally_owned_dofs stores a one-to-one map of all dofs, and holds
@@ -1221,10 +1221,11 @@ FSI_PU_DWR_Problem<dim>::setup_system_primal()
                                     constraints_primal,
                                     false);
 
-    SparsityTools::distribute_sparsity_pattern(dsp_primal,
-                                               dof_handler_primal.locally_owned_dofs(),
-                                               mpi_communicator,
-                                               locally_relevant_dofs_primal);
+    SparsityTools::distribute_sparsity_pattern(
+      dsp_primal,
+      dof_handler_primal.locally_owned_dofs(),
+      mpi_communicator,
+      locally_relevant_dofs_primal);
 
     system_matrix_primal.reinit(locally_owned_dofs_primal,
                                 locally_owned_dofs_primal,
@@ -1306,6 +1307,7 @@ FSI_PU_DWR_Problem<dim>::assemble_matrix_primal()
   const unsigned int n_q_points      = quadrature_formula.size();
   const unsigned int n_face_q_points = face_quadrature_formula.size();
 
+  Vector<double>     local_rhs(dofs_per_cell);
   FullMatrix<double> local_matrix(dofs_per_cell, dofs_per_cell);
 
   std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
@@ -1353,6 +1355,7 @@ FSI_PU_DWR_Problem<dim>::assemble_matrix_primal()
 
       fe_values.reinit(cell);
       local_matrix = 0;
+      local_rhs    = 0;
 
       // We need the cell diameter to control the fluid mesh motion
       cell_diameter = cell->diameter();
@@ -1620,13 +1623,6 @@ FSI_PU_DWR_Problem<dim>::assemble_matrix_primal()
 
             } // end face integrals do-nothing
 
-
-          // This is the same as discussed in step-22:
-          cell->get_dof_indices(local_dof_indices);
-          constraints_primal.distribute_local_to_global(local_matrix,
-                                                        local_dof_indices,
-                                                        system_matrix_primal);
-
           // Finally, we arrive at the end for assembling the matrix
           // for the fluid equations and step to the computation of the
           // structure terms:
@@ -1722,13 +1718,16 @@ FSI_PU_DWR_Problem<dim>::assemble_matrix_primal()
               // end n_q_points
             }
 
-
-          cell->get_dof_indices(local_dof_indices);
-          constraints_primal.distribute_local_to_global(local_matrix,
-                                                        local_dof_indices,
-                                                        system_matrix_primal);
           // end if (second PDE: STVK material)
         }
+
+      cell->get_dof_indices(local_dof_indices);
+      constraints_primal.distribute_local_to_global(local_matrix,
+                                                    local_rhs,
+                                                    local_dof_indices,
+                                                    system_matrix_primal,
+                                                    system_rhs_primal);
+
       // end cell
     }
 
@@ -1753,6 +1752,7 @@ FSI_PU_DWR_Problem<dim>::assemble_rhs_primal()
                            locally_relevant_dofs_primal,
                            mpi_communicator,
                            true);
+  system_rhs_primal = 0;
 
   QGauss<dim>     quadrature_formula(degree + 2);
   QGauss<dim - 1> face_quadrature_formula(degree + 2);
@@ -1773,7 +1773,8 @@ FSI_PU_DWR_Problem<dim>::assemble_rhs_primal()
   const unsigned int n_q_points      = quadrature_formula.size();
   const unsigned int n_face_q_points = face_quadrature_formula.size();
 
-  Vector<double> local_rhs(dofs_per_cell);
+  Vector<double>     local_rhs(dofs_per_cell);
+  FullMatrix<double> local_matrix(dofs_per_cell, dofs_per_cell);
 
   std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
 
@@ -1802,7 +1803,8 @@ FSI_PU_DWR_Problem<dim>::assemble_rhs_primal()
         continue;
 
       fe_values.reinit(cell);
-      local_rhs = 0;
+      local_rhs    = 0;
+      local_matrix = 0;
 
       cell_diameter = cell->diameter();
 
@@ -1992,11 +1994,6 @@ FSI_PU_DWR_Problem<dim>::assemble_rhs_primal()
             } // end face integrals do-nothing condition
 
 
-          cell->get_dof_indices(local_dof_indices);
-          constraints_primal.distribute_local_to_global(local_rhs,
-                                                        local_dof_indices,
-                                                        system_rhs_primal);
-
           // Finally, we arrive at the end for assembling
           // the variational formulation for the fluid part and step to
           // the assembling process of the structure terms:
@@ -2096,13 +2093,15 @@ FSI_PU_DWR_Problem<dim>::assemble_rhs_primal()
               // end n_q_points
             }
 
-          cell->get_dof_indices(local_dof_indices);
-          constraints_primal.distribute_local_to_global(local_rhs,
-                                                        local_dof_indices,
-                                                        system_rhs_primal);
-
           // end if (for STVK material)
         }
+
+      cell->get_dof_indices(local_dof_indices);
+      constraints_primal.distribute_local_to_global(local_matrix,
+                                                    local_rhs,
+                                                    local_dof_indices,
+                                                    system_matrix_primal,
+                                                    system_rhs_primal);
 
     } // end cell
   system_rhs_primal.compress(VectorOperation::add);
@@ -2281,6 +2280,8 @@ FSI_PU_DWR_Problem<dim>::solve_primal()
   // Solve
   A_direct_primal.solve(newton_update_primal, system_rhs_primal);
   constraints_primal.distribute(newton_update_primal);
+
+  newton_update_primal.compress(VectorOperation::add);
 }
 
 // This is the Newton iteration with simple linesearch backtracking
@@ -2343,7 +2344,8 @@ FSI_PU_DWR_Problem<dim>::newton_iteration_primal()
       timer_newton.start();
       old_newton_residual = newton_residual;
 
-      // TODO: Its quite expensive to compute this norm, as it requires a lot of communication
+      // TODO: Its quite expensive to compute this norm, as it requires a lot of
+      // communication
       linearization_point = solution_primal;
       old_solution_norm   = linearization_point.linfty_norm();
 
@@ -2365,7 +2367,8 @@ FSI_PU_DWR_Problem<dim>::newton_iteration_primal()
           break;
         }
 
-      if (newton_residual / old_newton_residual > nonlinear_rho)
+      //if (newton_residual / old_newton_residual > nonlinear_rho)
+      if (true)
         {
           assemble_matrix_primal();
           // Only factorize when matrix is re-built
@@ -2376,7 +2379,7 @@ FSI_PU_DWR_Problem<dim>::newton_iteration_primal()
       solve_primal();
 
       linearization_point = solution_primal;
-      line_search_step = 0;
+      line_search_step    = 0;
       for (; line_search_step < max_no_line_search_steps; ++line_search_step)
         {
           linearization_point += newton_update_primal;
@@ -2455,8 +2458,8 @@ FSI_PU_DWR_Problem<dim>::setup_system_adjoint()
   block_component[dim + dim] = 2;
 
   // TODO: for the first test we disable the DoFRenumbering
-  //DoFRenumbering::Cuthill_McKee(dof_handler_adjoint);
-  //DoFRenumbering::component_wise(dof_handler_adjoint, block_component);
+  // DoFRenumbering::Cuthill_McKee(dof_handler_adjoint);
+  // DoFRenumbering::component_wise(dof_handler_adjoint, block_component);
 
   // Get the working index sets:
   // locally_owned_dofs stores a one-to-one map of all dofs, and holds
@@ -5056,5 +5059,3 @@ main(int argc, char *argv[])
 
   return 0;
 }
-
-
