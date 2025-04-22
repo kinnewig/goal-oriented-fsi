@@ -72,6 +72,7 @@
 // files.
 #include <deal.II/base/function.h>
 #include <deal.II/base/logstream.h>
+#include <deal.II/base/parameter_handler.h>
 #include <deal.II/base/quadrature_lib.h>
 #include <deal.II/base/timer.h>
 #include <deal.II/base/utilities.h>
@@ -682,6 +683,269 @@ namespace Structure_Terms_in_ALE
 
 } // namespace Structure_Terms_in_ALE
 
+namespace Parameters
+{
+  struct GlobalValues
+  {
+    unsigned int degree;
+
+    static void
+    declare_parameters(ParameterHandler &prm);
+
+    void
+    parse_parameters(ParameterHandler &prm);
+  };
+
+  void
+  GlobalValues::declare_parameters(ParameterHandler &prm)
+  {
+    prm.enter_subsection("Global");
+    {
+      prm.declare_entry("degree", "2", Patterns::Integer(0), "degree");
+    }
+    prm.leave_subsection();
+  }
+
+  void
+  GlobalValues::parse_parameters(ParameterHandler &prm)
+  {
+    prm.enter_subsection("Global");
+    {
+      degree = prm.get_integer("degree");
+    }
+    prm.leave_subsection();
+  }
+
+
+
+  struct BoundaryValue
+  {
+    double inflow_velocity;
+    static void
+    declare_parameters(ParameterHandler &prm);
+
+    void
+    parse_parameters(ParameterHandler &prm);
+  };
+
+  void
+  BoundaryValue::declare_parameters(ParameterHandler &prm)
+  {
+    prm.enter_subsection("inflow_velocity_parameter");
+    {
+      prm.declare_entry("inflow_velocity",
+                        "0.3",
+                        Patterns::Double(0),
+                        "inlet velocity");
+    }
+    prm.leave_subsection();
+  }
+
+  void
+  BoundaryValue::parse_parameters(ParameterHandler &prm)
+  {
+    prm.enter_subsection("inflow_velocity_parameter");
+    {
+      inflow_velocity = prm.get_double("inflow_velocity");
+    }
+    prm.leave_subsection();
+  }
+
+  struct PhysicalConstants
+  {
+    double density_fluid;
+    double viscosity;
+    double density_structure;
+    double lame_coefficient_mu;
+    double poisson_ratio_nu;
+    double force_structure_x;
+    double force_structure_y;
+    double alpha_u;
+
+    static void
+    declare_parameters(ParameterHandler &prm);
+
+    void
+    parse_parameters(ParameterHandler &prm);
+  };
+
+  void
+  PhysicalConstants::declare_parameters(ParameterHandler &prm)
+  {
+    prm.enter_subsection("Physical constants");
+    {
+      prm.declare_entry("density_fluid",
+                        "1.0e+3",
+                        Patterns::Double(0),
+                        "density of fluid");
+      prm.declare_entry("viscosity",
+                        "1.0e-3",
+                        Patterns::Double(0),
+                        "viscosity of fluid");
+
+      prm.declare_entry("density_structure",
+                        "1.0e+3",
+                        Patterns::Double(0),
+                        "density of structure");
+      prm.declare_entry("lame_coefficient_mu",
+                        "0.5e+6",
+                        Patterns::Double(0),
+                        "mu");
+      prm.declare_entry("poisson_ratio_nu", "0.4", Patterns::Double(0), "nu");
+
+      prm.declare_entry("force_structure_x", "0.0", Patterns::Double(0), "fx");
+      prm.declare_entry("force_structure_y", "0.0", Patterns::Double(0), "fy");
+
+      prm.declare_entry("alpha_u", "1.0e-8", Patterns::Double(0), "alpha");
+    }
+    prm.leave_subsection();
+  }
+
+  void
+  PhysicalConstants::parse_parameters(ParameterHandler &prm)
+  {
+    prm.enter_subsection("Physical constants");
+    {
+      density_fluid       = prm.get_double("density_fluid");
+      viscosity           = prm.get_double("viscosity");
+      density_structure   = prm.get_double("density_structure");
+      lame_coefficient_mu = prm.get_double("lame_coefficient_mu");
+      poisson_ratio_nu    = prm.get_double("poisson_ratio_nu");
+      force_structure_x   = prm.get_double("force_structure_x");
+      force_structure_y   = prm.get_double("force_structure_y");
+      alpha_u             = prm.get_double("alpha_u");
+    }
+    prm.leave_subsection();
+  }
+
+
+  struct DWRParameters
+  {
+    // pressure, drag, lift, displacement
+    std::string adjoint_rhs;
+    int         max_no_refinement_cycles;
+    int         max_no_degrees_of_freedom;
+    double      TOL_DWR_estimator;
+
+    // Setting tolerance for primal Newton solver
+    double lower_bound_newton_residual;
+    double lower_bound_newton_residual_relative;
+
+    static void
+    declare_parameters(ParameterHandler &prm);
+
+    void
+    parse_parameters(ParameterHandler &prm);
+
+    std::string refinement_strategy;
+  };
+
+  void
+  DWRParameters::declare_parameters(ParameterHandler &prm)
+  {
+    prm.enter_subsection("Pressure, drag, lift, displacement");
+    {
+      prm.declare_entry("adjoint_rhs",
+                        "drag",
+                        Patterns::Selection("drag|lift"),
+                        "drag or lift");
+
+      prm.declare_entry("max_no_refinement_cycles",
+                        "4",
+                        Patterns::Integer(0),
+                        "maximal number of refinement cycles");
+
+      prm.declare_entry("max_no_degrees_of_freedom",
+                        "2.0e+6",
+                        Patterns::Double(0),
+                        "maximal number of degrees of freedom");
+
+      prm.declare_entry("TOL_DWR_estimator",
+                        "1.0e-5",
+                        Patterns::Double(0),
+                        "error tolerance for the DWR estimator");
+
+      prm.declare_entry("lower_bound_newton_residual",
+                        "1.0e-10",
+                        Patterns::Double(0),
+                        "lower bound for the newton residual");
+
+      prm.declare_entry("lower_bound_newton_residual_relative",
+                        "1.0e-8",
+                        Patterns::Double(0),
+                        "relative lower bound for the newton residual");
+
+      prm.declare_entry("refinement_strategy",
+                        "PU_DWR",
+                        Patterns::Selection(
+                          "global_refinement|PU_DWR|Solid-oriented"),
+                        "refinement strategy");
+    }
+    prm.leave_subsection();
+  }
+
+  void
+  DWRParameters::parse_parameters(ParameterHandler &prm)
+  {
+    prm.enter_subsection("Pressure, drag, lift, displacement");
+    {
+      adjoint_rhs               = prm.get("adjoint_rhs");
+      max_no_refinement_cycles  = prm.get_integer("max_no_refinement_cycles");
+      max_no_degrees_of_freedom = prm.get_double("max_no_degrees_of_freedom");
+      TOL_DWR_estimator         = prm.get_double("TOL_DWR_estimator");
+
+      lower_bound_newton_residual =
+        prm.get_double("lower_bound_newton_residual");
+      lower_bound_newton_residual_relative =
+        prm.get_double("lower_bound_newton_residual_relative");
+
+      refinement_strategy = prm.get("refinement_strategy");
+    }
+  }
+
+
+
+  struct AllParameters : public GlobalValues,
+                         public BoundaryValue,
+                         public PhysicalConstants,
+                         public DWRParameters
+  {
+    AllParameters(const std::string &input_file);
+
+    static void
+    declare_parameters(ParameterHandler &prm);
+
+    void
+    parse_parameters(ParameterHandler &prm);
+  };
+
+  AllParameters::AllParameters(const std::string &input_file)
+  {
+    ParameterHandler prm;
+    declare_parameters(prm);
+    prm.parse_input(input_file);
+    parse_parameters(prm);
+  }
+
+  void
+  AllParameters::declare_parameters(ParameterHandler &prm)
+  {
+    GlobalValues::declare_parameters(prm);
+    BoundaryValue::declare_parameters(prm);
+    PhysicalConstants::declare_parameters(prm);
+    DWRParameters::declare_parameters(prm);
+  }
+
+  void
+  AllParameters::parse_parameters(ParameterHandler &prm)
+  {
+    GlobalValues::parse_parameters(prm);
+    BoundaryValue::parse_parameters(prm);
+    PhysicalConstants::parse_parameters(prm);
+    DWRParameters::parse_parameters(prm);
+  }
+} // namespace Parameters
+
 
 
 // In this class, we define a function
@@ -693,20 +957,22 @@ template <int dim>
 class BoundaryParabel : public Function<dim>
 {
 public:
-  BoundaryParabel(const double time)
+  BoundaryParabel(const double time, const double inflow_velocity)
     : Function<dim>(dim + dim + 1)
   {
-    _time = time;
+    _time            = time;
+    _inflow_velocity = inflow_velocity;
   }
 
   virtual double
-  value(const Point<dim> &p, const unsigned int component = 0) const;
+  value(const Point<dim> &p, const unsigned int component = 0) const override;
 
   virtual void
-  vector_value(const Point<dim> &p, Vector<double> &value) const;
+  vector_value(const Point<dim> &p, Vector<double> &value) const override;
 
 private:
   double _time;
+  double _inflow_velocity;
 };
 
 // The boundary values are given to component
@@ -730,14 +996,15 @@ BoundaryParabel<dim>::value(const Point<dim>  &p,
   // the inflow. Hence, we use the cosine function
   // to control the inflow at the beginning until
   // the total time 2.0 has been reached.
-  double inflow_velocity = 0.2;
+
+  // double inflow_velocity=0.2;
 
   if (component == 0)
     {
       // FSI 1 and BFAC 2D-1, 2D-2
       {
         return ((p(0) == 0) && (p(1) <= 0.41) ?
-                  -1.5 * inflow_velocity * (4.0 / 0.1681) *
+                  -1.5 * _inflow_velocity * (4.0 / 0.1681) *
                     (std::pow(p(1), 2) - 0.41 * std::pow(p(1), 1)) :
                   0);
       }
@@ -811,7 +1078,7 @@ template <int dim>
 class FSI_PU_DWR_Problem
 {
 public:
-  FSI_PU_DWR_Problem(const unsigned int degree);
+  FSI_PU_DWR_Problem(const std::string &input_file);
   ~FSI_PU_DWR_Problem();
   void
   run();
@@ -898,8 +1165,9 @@ private:
   refine_average_with_PU_DWR(const unsigned int refinement_cycle);
 
 
-  // Global refinement
-  const unsigned int degree;
+  // Global parameters
+  Parameters::AllParameters parameters;
+  const unsigned int        degree;
 
   Triangulation<dim> triangulation;
 
@@ -977,43 +1245,34 @@ private:
 // We are going to use the following finite element discretization:
 // Q_2^c for the fluid, Q_2^c for the solid, P_1^dc for the pressure.
 template <int dim>
-FSI_PU_DWR_Problem<dim>::FSI_PU_DWR_Problem(const unsigned int degree)
-  : degree(degree)
+FSI_PU_DWR_Problem<dim>::FSI_PU_DWR_Problem(const std::string &input_file)
+  : parameters(input_file)
+  , degree(parameters.degree)
+  , triangulation(Triangulation<dim>::none)
+  , fe_primal(FE_Q<dim>(degree + 1),
+              dim, /*velocities*/
+              FE_Q<dim>(degree + 1),
+              dim, /*displacements*/
+              FE_Q<dim>(degree),
+              1 /*pressure*/)
+  , dof_handler_primal(triangulation)
   ,
-  // triangulation (Triangulation<dim>::maximum_smoothing),
-  triangulation(Triangulation<dim>::none)
-  ,
-
-  fe_primal(FE_Q<dim>(2),
-            dim, // velocities
-            FE_Q<dim>(2),
-            dim, // displacements
-            FE_Q<dim>(1),
-            1)
-  , // pressure
-  dof_handler_primal(triangulation)
-  ,
-
   // Info: adjoint degree must be higher than primal
   // degree as usual for DWR-based error estimation (see step-14)
-  fe_adjoint(FE_Q<dim>(4),
-             dim, // velocities
-             FE_Q<dim>(4),
-             dim, // displacements
-             FE_Q<dim>(2),
-             1)
-  , // pressure
-  dof_handler_adjoint(triangulation)
+  fe_adjoint(FE_Q<dim>((degree + 1) * 2),
+             dim, /*velocities*/
+             FE_Q<dim>((degree + 1) * 2),
+             dim, /*displacements*/
+             FE_Q<dim>(degree * 2),
+             1 /*pressure*/)
+  , dof_handler_adjoint(triangulation)
   ,
-
   // Lowest order FE (partition-of-unity) to gather neighboring information
   // see Richter/Wick; JCAM, 2015
   // https://www.sciencedirect.com/science/article/pii/S0377042714004798
   fe_pou(FE_Q<dim>(1), 1)
   , dof_handler_pou(triangulation)
-  ,
-
-  timer(std::cout, TimerOutput::summary, TimerOutput::cpu_times)
+  , timer(std::cout, TimerOutput::summary, TimerOutput::cpu_times)
 {}
 
 
@@ -1032,54 +1291,42 @@ template <int dim>
 void
 FSI_PU_DWR_Problem<dim>::set_runtime_parameters()
 {
-  // Defining test cases
-  // 2D-1: Schaefer/Turek benchmark 1996
-  // FSI_1: Hron/Turek benchmark 2006
-  test_case = "FSI_1";
+  // Fluid parameters
+  density_fluid = parameters.density_fluid;
+  viscosity     = parameters.viscosity;
+
+  // Structure parameters
+  // FSI 1 & 3: 1.0e+3; FSI 2: 1.0e+4
+  // density_structure = 1.0e+3;
+  // FSI 1 & 2: 0.5e+6; FSI 3: 2.0e+6
+  // lame_coefficient_mu = 0.5e+6;
+  // poisson_ratio_nu = 0.4;
+  density_structure   = parameters.density_structure;
+  lame_coefficient_mu = parameters.lame_coefficient_mu;
+  poisson_ratio_nu    = parameters.poisson_ratio_nu;
+
   // pressure, drag, lift, displacement
-  adjoint_rhs               = "drag";
-  max_no_refinement_cycles  = 4;
-  max_no_degrees_of_freedom = 2.0e+6;
-  TOL_DWR_estimator         = 1.0e-5;
+  adjoint_rhs               = parameters.adjoint_rhs;
+  max_no_refinement_cycles  = parameters.max_no_refinement_cycles;
+  max_no_degrees_of_freedom = parameters.max_no_degrees_of_freedom;
+  TOL_DWR_estimator         = parameters.TOL_DWR_estimator;
 
   // Setting tolerance for primal Newton solver
-  lower_bound_newton_residual          = 1.0e-10;
-  lower_bound_newton_residual_relative = 1.0e-8;
+  lower_bound_newton_residual = parameters.lower_bound_newton_residual;
+  lower_bound_newton_residual_relative =
+    parameters.lower_bound_newton_residual_relative;
 
   // 0: global refinement
   // 1: PU DWR
   // 2: Solid-oriented
   refinement_strategy = 1;
 
-  // Fluid parameters (FSI 1)
-  if (test_case == "FSI_1")
-    {
-      density_fluid = 1.0e+3;
-      viscosity     = 1.0e-3;
-    }
-
-  // 2D-1 1996 benchmark
-  if (test_case == "2D-1")
-    {
-      density_fluid = 1.0;
-      viscosity     = 1.0e-3;
-    }
-
-  // FSI 1 & 3: 1.0e+3; FSI 2: 1.0e+4
-  density_structure = 1.0e+3;
-
-
-  // Structure parameters
-  // FSI 1 & 2: 0.5e+6; FSI 3: 2.0e+6
-  lame_coefficient_mu = 0.5e+6;
-  poisson_ratio_nu    = 0.4;
-
   lame_coefficient_lambda =
     (2 * poisson_ratio_nu * lame_coefficient_mu) / (1.0 - 2 * poisson_ratio_nu);
 
   // Force on beam
-  force_structure_x = 0.0;
-  force_structure_y = 0.0;
+  force_structure_x = parameters.force_structure_x;
+  force_structure_y = parameters.force_structure_y;
 
   // For example gravity
   force_fluid_x = 0.0;
@@ -1088,7 +1335,7 @@ FSI_PU_DWR_Problem<dim>::set_runtime_parameters()
 
   // Diffusion parameters to control the fluid mesh motion
   // The higher these parameters the stiffer the fluid mesh.
-  alpha_u = 1.0e-10;
+  alpha_u = parameters.alpha_u;
 
 
   // In the following, we read a *.inp grid from a file.
@@ -1096,10 +1343,10 @@ FSI_PU_DWR_Problem<dim>::set_runtime_parameters()
   // fluid-structure interaction benchmark problems
   // (Lit. J. Hron, S. Turek, 2006)
   std::string grid_name;
-  if (test_case == "FSI_1")
-    grid_name = "fsi.inp";
-  else if (test_case == "2D-1")
-    grid_name = "nsbench4_original.inp";
+  // if (test_case == "FSI_1")
+  grid_name = "fsi.inp";
+  // else if (test_case == "2D-1")
+  //   grid_name = "nsbench4_original.inp";
 
   GridIn<dim> grid_in;
   grid_in.attach_triangulation(triangulation);
@@ -2092,11 +2339,12 @@ FSI_PU_DWR_Problem<dim>::set_initial_bc_primal()
   // (Scalar) pressure
   component_mask[dim + dim] = false;
 
-  VectorTools::interpolate_boundary_values(dof_handler_primal,
-                                           0,
-                                           BoundaryParabel<dim>(time),
-                                           boundary_values,
-                                           component_mask);
+  VectorTools::interpolate_boundary_values(
+    dof_handler_primal,
+    0,
+    BoundaryParabel<dim>(time, parameters.inflow_velocity),
+    boundary_values,
+    component_mask);
 
 
   component_mask[dim] = false; // ux
@@ -2213,7 +2461,7 @@ void
 FSI_PU_DWR_Problem<dim>::solve_primal()
 {
   TimerOutput::Scope t(timer, "Solve primal linear system.");
-  Vector<double> sol, rhs;
+  Vector<double>     sol, rhs;
   sol = newton_update_primal;
   rhs = system_rhs_primal;
 
@@ -3383,7 +3631,7 @@ FSI_PU_DWR_Problem<dim>::solve_adjoint()
 
   // Linear solution
   TimerOutput::Scope t(timer, "Solve linear adjoint system.");
-  Vector<double> sol, rhs;
+  Vector<double>     sol, rhs;
   sol = solution_adjoint;
   rhs = system_rhs_adjoint;
 
@@ -4924,7 +5172,7 @@ main()
     {
       deallog.depth_console(0);
 
-      FSI_PU_DWR_Problem<2> fsi_pu_dwr_problem(1);
+      FSI_PU_DWR_Problem<2> fsi_pu_dwr_problem("step-fsi.prm");
       fsi_pu_dwr_problem.run();
     }
   catch (std::exception &exc)
