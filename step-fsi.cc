@@ -87,18 +87,16 @@
 #include <deal.II/lac/full_matrix.h>
 #include <deal.II/lac/sparse_direct.h>
 // #include <deal.II/grid/tria_boundary_lib.h>
-#include <deal.II/grid/grid_in.h>
-#include <deal.II/grid/grid_tools.h>
+//
 // From deal.II 9.x.x
+#include <deal.II/distributed/grid_refinement.h>
+#include <deal.II/distributed/tria.h>
+
 #include <deal.II/dofs/dof_accessor.h>
 #include <deal.II/dofs/dof_handler.h>
 #include <deal.II/dofs/dof_renumbering.h>
 #include <deal.II/dofs/dof_tools.h>
 
-#include <deal.II/grid/manifold_lib.h>
-
-
-// #include <deal.II/lac/constraint_matrix.h>
 #include <deal.II/fe/fe_dgp.h>
 #include <deal.II/fe/fe_dgq.h>
 #include <deal.II/fe/fe_q.h>
@@ -107,7 +105,13 @@
 #include <deal.II/fe/fe_values.h>
 #include <deal.II/fe/mapping_q1.h>
 
+#include <deal.II/grid/grid_in.h>
+#include <deal.II/grid/grid_out.h>
+#include <deal.II/grid/grid_tools.h>
+#include <deal.II/grid/manifold_lib.h>
+
 #include <deal.II/lac/affine_constraints.h>
+#include <deal.II/lac/affine_constraints.templates.h>
 #include <deal.II/lac/precondition.h>
 #include <deal.II/lac/solver_cg.h>
 
@@ -116,6 +120,11 @@
 #include <deal.II/numerics/solution_transfer.h>
 #include <deal.II/numerics/vector_tools.h>
 
+// Trilinos Tpetra SparseMatrix and Vector
+#include <deal.II/lac/trilinos_tpetra_solver_direct.h>
+#include <deal.II/lac/trilinos_tpetra_sparse_matrix.h>
+#include <deal.II/lac/trilinos_tpetra_vector.h>
+#include <deal.II/lac/vector_operation.h>
 
 // C++
 #include <fstream>
@@ -701,7 +710,7 @@ namespace Parameters
   {
     prm.enter_subsection("Global");
     {
-      prm.declare_entry("degree", "2", Patterns::Integer(0), "degree");
+      prm.declare_entry("degree", "1", Patterns::Integer(0), "degree");
     }
     prm.leave_subsection();
   }
@@ -1164,39 +1173,44 @@ private:
   double
   refine_average_with_PU_DWR(const unsigned int refinement_cycle);
 
+  MPI_Comm mpi_communicator;
 
   // Global parameters
   Parameters::AllParameters parameters;
   const unsigned int        degree;
 
-  Triangulation<dim> triangulation;
+  parallel::distributed::Triangulation<dim> triangulation;
 
   // Primal solution
   FESystem<dim>   fe_primal;
   DoFHandler<dim> dof_handler_primal;
 
+  IndexSet locally_owned_dofs_primal;
+  IndexSet locally_relevant_dofs_primal;
+
   AffineConstraints<double> constraints_primal;
 
-  BlockSparsityPattern      sparsity_pattern_primal;
-  BlockSparseMatrix<double> system_matrix_primal;
-
-  BlockVector<double> solution_primal, newton_update_primal,
-    old_timestep_solution_primal;
-  BlockVector<double> system_rhs_primal;
-
-  SparseDirectUMFPACK A_direct_primal;
+  LinearAlgebra::TpetraWrappers::SparseMatrix<double> system_matrix_primal;
+  LinearAlgebra::TpetraWrappers::Vector<double>       solution_primal;
+  LinearAlgebra::TpetraWrappers::Vector<double>       newton_update_primal;
+  LinearAlgebra::TpetraWrappers::Vector<double> old_timestep_solution_primal;
+  LinearAlgebra::TpetraWrappers::Vector<double> system_rhs_primal;
 
   // Adjoint solution
   FESystem<dim>   fe_adjoint;
   DoFHandler<dim> dof_handler_adjoint;
 
+  IndexSet locally_owned_dofs_adjoint;
+  IndexSet locally_relevant_dofs_adjoint;
+
   AffineConstraints<double> constraints_adjoint;
 
-  BlockSparsityPattern      sparsity_pattern_adjoint;
-  BlockSparseMatrix<double> system_matrix_adjoint;
+  LinearAlgebra::TpetraWrappers::SparseMatrix<double> system_matrix_adjoint;
+  LinearAlgebra::TpetraWrappers::Vector<double>       solution_adjoint;
+  LinearAlgebra::TpetraWrappers::Vector<double>       newton_update_adjoint;
+  LinearAlgebra::TpetraWrappers::Vector<double> old_timestep_solution_adjoint;
+  LinearAlgebra::TpetraWrappers::Vector<double> system_rhs_adjoint;
 
-  BlockVector<double> solution_adjoint, old_timestep_solution_adjoint;
-  BlockVector<double> system_rhs_adjoint;
 
   // PU for PU-DWR localization
   FESystem<dim>   fe_pou;
@@ -1204,8 +1218,8 @@ private:
   Vector<float>   error_indicators;
 
 
-  // Measuring CPU times
-  TimerOutput timer;
+  ConditionalOStream pcout;
+  TimerOutput        timer;
 
 
   // Fluid parameters
@@ -1246,9 +1260,10 @@ private:
 // Q_2^c for the fluid, Q_2^c for the solid, P_1^dc for the pressure.
 template <int dim>
 FSI_PU_DWR_Problem<dim>::FSI_PU_DWR_Problem(const std::string &input_file)
-  : parameters(input_file)
+  : mpi_communicator(MPI_COMM_WORLD)
+  , parameters(input_file)
   , degree(parameters.degree)
-  , triangulation(Triangulation<dim>::none)
+  , triangulation(mpi_communicator, Triangulation<dim>::none)
   , fe_primal(FE_Q<dim>(degree + 1),
               dim, /*velocities*/
               FE_Q<dim>(degree + 1),
@@ -1272,7 +1287,8 @@ FSI_PU_DWR_Problem<dim>::FSI_PU_DWR_Problem(const std::string &input_file)
   // https://www.sciencedirect.com/science/article/pii/S0377042714004798
   fe_pou(FE_Q<dim>(1), 1)
   , dof_handler_pou(triangulation)
-  , timer(std::cout, TimerOutput::summary, TimerOutput::cpu_times)
+  , pcout(std::cout, (Utilities::MPI::this_mpi_process(mpi_communicator) == 0))
+  , timer(mpi_communicator, pcout, TimerOutput::never, TimerOutput::wall_times)
 {}
 
 
@@ -1343,10 +1359,11 @@ FSI_PU_DWR_Problem<dim>::set_runtime_parameters()
   // fluid-structure interaction benchmark problems
   // (Lit. J. Hron, S. Turek, 2006)
   std::string grid_name;
-  // if (test_case == "FSI_1")
-  grid_name = "fsi.inp";
-  // else if (test_case == "2D-1")
-  //   grid_name = "nsbench4_original.inp";
+  test_case = "FSI_1";
+  if (test_case == "FSI_1")
+    grid_name = "fsi.inp";
+  else if (test_case == "2D-1")
+    grid_name = "nsbench4_original.inp";
 
   GridIn<dim> grid_in;
   grid_in.attach_triangulation(triangulation);
@@ -1370,6 +1387,7 @@ FSI_PU_DWR_Problem<dim>::set_runtime_parameters()
 
   triangulation.refine_global(1);
 
+  // ToDo: This probably does not work in parallel...
   // For DWR output (effectivity indices, error behavior, etc.) into files
   std::string filename         = "dwr_results.txt";
   std::string filename_gnuplot = "dwr_results_gp.txt";
@@ -1406,79 +1424,71 @@ FSI_PU_DWR_Problem<dim>::setup_system_primal()
   block_component[dim + 1]   = 1;
   block_component[dim + dim] = 2;
 
-  DoFRenumbering::component_wise(dof_handler_primal, block_component);
+  // DoFRenumbering::component_wise(dof_handler_primal, block_component);
+
+  // Get the working index sets:
+  // locally_owned_dofs stores a one-to-one map of all dofs, and holds
+  //                    the dofs that belong to this rank.
+  // locally_relevant_dofs contains the locally_owned_dofs and also some
+  //                    dofs that do belong to other ranks but are relevant
+  //                    for the rank.
+  locally_owned_dofs_primal = dof_handler_primal.locally_owned_dofs();
+  locally_relevant_dofs_primal =
+    DoFTools::extract_locally_relevant_dofs(dof_handler_primal);
 
   {
     constraints_primal.clear();
+    constraints_primal.reinit(locally_owned_dofs_primal,
+                              locally_relevant_dofs_primal);
     set_newton_bc_primal();
     DoFTools::make_hanging_node_constraints(dof_handler_primal,
                                             constraints_primal);
+    constraints_primal.close();
   }
-  constraints_primal.close();
 
-  std::vector<types::global_dof_index> dofs_per_block(3);
-  dofs_per_block =
-    DoFTools::count_dofs_per_fe_block(dof_handler_primal, block_component);
-  const unsigned int n_v = dofs_per_block[0], n_u = dofs_per_block[1],
-                     n_p = dofs_per_block[2];
-
-  std::cout << "Cells:\t" << triangulation.n_active_cells() << std::endl
-            << "DoFs (primal):\t" << dof_handler_primal.n_dofs() << " (" << n_v
-            << '+' << n_u << '+' << n_p << ')' << std::endl;
-
-
+  pcout << "Cells:\t" << triangulation.n_active_cells() << std::endl
+        << "DoFs (primal):\t" << dof_handler_primal.n_dofs() << std::endl;
 
   {
-    BlockDynamicSparsityPattern csp(3, 3);
-
-    csp.block(0, 0).reinit(n_v, n_v);
-    csp.block(0, 1).reinit(n_v, n_u);
-    csp.block(0, 2).reinit(n_v, n_p);
-
-    csp.block(1, 0).reinit(n_u, n_v);
-    csp.block(1, 1).reinit(n_u, n_u);
-    csp.block(1, 2).reinit(n_u, n_p);
-
-    csp.block(2, 0).reinit(n_p, n_v);
-    csp.block(2, 1).reinit(n_p, n_u);
-    csp.block(2, 2).reinit(n_p, n_p);
-
-    csp.collect_sizes();
-
+    DynamicSparsityPattern dsp_primal(locally_relevant_dofs_primal);
 
     DoFTools::make_sparsity_pattern(dof_handler_primal,
-                                    csp,
+                                    dsp_primal,
                                     constraints_primal,
                                     false);
+    SparsityTools::distribute_sparsity_pattern(
+      dsp_primal,
+      dof_handler_primal.locally_owned_dofs(),
+      mpi_communicator,
+      locally_relevant_dofs_primal);
 
-    sparsity_pattern_primal.copy_from(csp);
+    system_matrix_primal.reinit(locally_owned_dofs_primal,
+                                locally_owned_dofs_primal,
+                                dsp_primal,
+                                mpi_communicator);
   }
 
-  system_matrix_primal.reinit(sparsity_pattern_primal);
+  // Actual solution at time step n
+  solution_primal.reinit(locally_owned_dofs_primal,
+                         locally_relevant_dofs_primal,
+                         mpi_communicator);
 
-  // Actual solution
-  solution_primal.reinit(3);
-  solution_primal.block(0).reinit(n_v);
-  solution_primal.block(1).reinit(n_u);
-  solution_primal.block(2).reinit(n_p);
-
-  solution_primal.collect_sizes();
+  // Old timestep solution at time step n-1
+  old_timestep_solution_primal.reinit(locally_owned_dofs_primal,
+                                      locally_relevant_dofs_primal,
+                                      mpi_communicator);
 
   // Updates for Newton's method
-  newton_update_primal.reinit(3);
-  newton_update_primal.block(0).reinit(n_v);
-  newton_update_primal.block(1).reinit(n_u);
-  newton_update_primal.block(2).reinit(n_p);
-
-  newton_update_primal.collect_sizes();
+  newton_update_primal.reinit(locally_owned_dofs_primal,
+                              locally_relevant_dofs_primal,
+                              mpi_communicator,
+                              true);
 
   // Residual for  Newton's method
-  system_rhs_primal.reinit(3);
-  system_rhs_primal.block(0).reinit(n_v);
-  system_rhs_primal.block(1).reinit(n_u);
-  system_rhs_primal.block(2).reinit(n_p);
-
-  system_rhs_primal.collect_sizes();
+  system_rhs_primal.reinit(locally_owned_dofs_primal,
+                           locally_relevant_dofs_primal,
+                           mpi_communicator,
+                           true);
 }
 
 
@@ -1527,6 +1537,7 @@ FSI_PU_DWR_Problem<dim>::assemble_matrix_primal()
   const unsigned int n_q_points      = quadrature_formula.size();
   const unsigned int n_face_q_points = face_quadrature_formula.size();
 
+  Vector<double>     local_rhs(dofs_per_cell);
   FullMatrix<double> local_matrix(dofs_per_cell, dofs_per_cell);
 
   std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
@@ -1569,7 +1580,11 @@ FSI_PU_DWR_Problem<dim>::assemble_matrix_primal()
 
   for (const auto &cell : dof_handler_primal.active_cell_iterators())
     {
+      if (!cell->is_locally_owned())
+        continue;
+
       fe_values.reinit(cell);
+      local_rhs    = 0;
       local_matrix = 0;
 
       // We need the cell diameter to control the fluid mesh motion
@@ -1612,8 +1627,8 @@ FSI_PU_DWR_Problem<dim>::assemble_matrix_primal()
               const Tensor<2, dim> grad_v_T =
                 ALE_Transformations ::get_grad_v_T<dim>(grad_v);
 
-              //	      const Tensor<2,dim> grad_u = ALE_Transformations
-              //	::get_grad_u<dim> (q, old_solution_grads);
+              // const Tensor<2,dim> grad_u =
+              //  ALE_Transformations::get_grad_u<dim> (q, old_solution_grads);
 
               const Tensor<2, dim> F =
                 ALE_Transformations ::get_F<dim>(q, old_solution_grads);
@@ -1838,13 +1853,6 @@ FSI_PU_DWR_Problem<dim>::assemble_matrix_primal()
 
             } // end face integrals do-nothing
 
-
-          // This is the same as discussed in step-22:
-          cell->get_dof_indices(local_dof_indices);
-          constraints_primal.distribute_local_to_global(local_matrix,
-                                                        local_dof_indices,
-                                                        system_matrix_primal);
-
           // Finally, we arrive at the end for assembling the matrix
           // for the fluid equations and step to the computation of the
           // structure terms:
@@ -1941,14 +1949,20 @@ FSI_PU_DWR_Problem<dim>::assemble_matrix_primal()
             }
 
 
-          cell->get_dof_indices(local_dof_indices);
-          constraints_primal.distribute_local_to_global(local_matrix,
-                                                        local_dof_indices,
-                                                        system_matrix_primal);
           // end if (second PDE: STVK material)
         }
+
+      cell->get_dof_indices(local_dof_indices);
+      constraints_primal.distribute_local_to_global(local_matrix,
+                                                    local_rhs,
+                                                    local_dof_indices,
+                                                    system_matrix_primal,
+                                                    system_rhs_primal);
+
       // end cell
     }
+
+  system_matrix_primal.compress(VectorOperation::add);
 }
 
 
@@ -1962,6 +1976,10 @@ void
 FSI_PU_DWR_Problem<dim>::assemble_rhs_primal()
 {
   TimerOutput::Scope t(timer, "Assemble primal rhs.");
+  system_rhs_primal.reinit(locally_owned_dofs_primal,
+                           locally_relevant_dofs_primal,
+                           mpi_communicator,
+                           true);
   system_rhs_primal = 0;
 
   QGauss<dim>     quadrature_formula(degree + 2);
@@ -1983,7 +2001,8 @@ FSI_PU_DWR_Problem<dim>::assemble_rhs_primal()
   const unsigned int n_q_points      = quadrature_formula.size();
   const unsigned int n_face_q_points = face_quadrature_formula.size();
 
-  Vector<double> local_rhs(dofs_per_cell);
+  Vector<double>     local_rhs(dofs_per_cell);
+  FullMatrix<double> local_matrix(dofs_per_cell, dofs_per_cell);
 
   std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
 
@@ -2008,8 +2027,12 @@ FSI_PU_DWR_Problem<dim>::assemble_rhs_primal()
 
   for (const auto &cell : dof_handler_primal.active_cell_iterators())
     {
+      if (!cell->is_locally_owned())
+        continue;
+
       fe_values.reinit(cell);
-      local_rhs = 0;
+      local_rhs    = 0;
+      local_matrix = 0;
 
       cell_diameter = cell->diameter();
 
@@ -2198,12 +2221,6 @@ FSI_PU_DWR_Problem<dim>::assemble_rhs_primal()
                 }
             } // end face integrals do-nothing condition
 
-
-          cell->get_dof_indices(local_dof_indices);
-          constraints_primal.distribute_local_to_global(local_rhs,
-                                                        local_dof_indices,
-                                                        system_rhs_primal);
-
           // Finally, we arrive at the end for assembling
           // the variational formulation for the fluid part and step to
           // the assembling process of the structure terms:
@@ -2302,16 +2319,21 @@ FSI_PU_DWR_Problem<dim>::assemble_rhs_primal()
                 }
               // end n_q_points
             }
-
-          cell->get_dof_indices(local_dof_indices);
-          constraints_primal.distribute_local_to_global(local_rhs,
-                                                        local_dof_indices,
-                                                        system_rhs_primal);
-
           // end if (for STVK material)
         }
 
+      cell->get_dof_indices(local_dof_indices);
+      constraints_primal.distribute_local_to_global(local_matrix,
+                                                    local_rhs,
+                                                    local_dof_indices,
+                                                    system_matrix_primal,
+                                                    system_rhs_primal);
     } // end cell
+
+  system_rhs_primal.compress(VectorOperation::add);
+
+  // Set boundary conditions:
+  // set_newton_bc_primal(system_rhs_primal);
 }
 
 
@@ -2389,11 +2411,25 @@ FSI_PU_DWR_Problem<dim>::set_initial_bc_primal()
                                            boundary_values,
                                            component_mask);
 
-  for (typename std::map<types::global_dof_index, double>::const_iterator i =
-         boundary_values.begin();
-       i != boundary_values.end();
-       ++i)
-    solution_primal(i->first) = i->second;
+  // The solution vector is read-only. Therefore, we need
+  // to create a vector with write access first, and
+  // cast the solution onto it.
+  LinearAlgebra::TpetraWrappers::Vector<double> completely_distributed_solution(
+    locally_owned_dofs_primal,
+    locally_relevant_dofs_primal,
+    mpi_communicator,
+    true);
+  completely_distributed_solution = solution_primal;
+
+  for (auto &boundary_value : boundary_values)
+    completely_distributed_solution(boundary_value.first) =
+      boundary_value.second;
+
+  // Communicate the the completely_distributed_solution
+  // to the others processes. I.e. we cast the
+  // completely_distributed_solution onto the
+  // read-only solution vector
+  solution_primal = completely_distributed_solution;
 }
 
 // This function applies boundary conditions
@@ -2453,6 +2489,8 @@ FSI_PU_DWR_Problem<dim>::set_newton_bc_primal()
                                            component_mask);
 }
 
+
+
 // In this function, we solve the linear systems
 // inside the nonlinear Newton iteration. For simplicity we
 // use a direct solver from UMFPACK.
@@ -2461,13 +2499,21 @@ void
 FSI_PU_DWR_Problem<dim>::solve_primal()
 {
   TimerOutput::Scope t(timer, "Solve primal linear system.");
-  Vector<double>     sol, rhs;
-  sol = newton_update_primal;
-  rhs = system_rhs_primal;
 
-  A_direct_primal.vmult(sol, rhs);
-  newton_update_primal = sol;
+  // create the solver_control object
+  SolverControl solver_control(dof_handler_primal.n_dofs(), 1e-12);
 
+  LinearAlgebra::TpetraWrappers::SolverDirect<double>::AdditionalData
+    additional_data("UMFPACK");
+
+  LinearAlgebra::TpetraWrappers::SolverDirect<double> A_direct_primal(
+    solver_control, additional_data);
+
+  A_direct_primal.initialize(system_matrix_primal);
+
+  A_direct_primal.solve(newton_update_primal, system_rhs_primal);
+
+  newton_update_primal.compress(VectorOperation::add);
   constraints_primal.distribute(newton_update_primal);
 }
 
@@ -2479,7 +2525,6 @@ FSI_PU_DWR_Problem<dim>::solve_primal()
 template <int dim>
 void
 FSI_PU_DWR_Problem<dim>::newton_iteration_primal()
-
 {
   Timer timer_newton;
   Timer timer_newton_global;
@@ -2497,6 +2542,9 @@ FSI_PU_DWR_Problem<dim>::newton_iteration_primal()
   const double       line_search_damping      = 0.6;
   double             new_newton_residual;
 
+  LinearAlgebra::TpetraWrappers::Vector<double> linearization_point(
+    locally_owned_dofs_primal, mpi_communicator);
+
   // Application of the initial boundary conditions to the
   // variational equations:
   set_initial_bc_primal();
@@ -2510,14 +2558,14 @@ FSI_PU_DWR_Problem<dim>::newton_iteration_primal()
   unsigned int newton_step         = 1;
 
   // Output explanation
-  std::cout << "Iter" << '\t' << "Res (abs)" << '\t' << "Res (rel)" << '\t'
-            << "Iter-Err (abs)" << '\t' << "Iter-Err (rel)" << '\t'
-            << "Res reduct" << '\t' << "Reb Jac" << '\t' << "LS" << '\t'
-            << "Wall time" << std::endl;
+  pcout << "Iter" << '\t' << "Res (abs)" << '\t' << "Res (rel)" << '\t'
+        << "Iter-Err (abs)" << '\t' << "Iter-Err (rel)" << '\t' << "Res reduct"
+        << '\t' << "Reb Jac" << '\t' << "LS" << '\t' << "Wall time"
+        << std::endl;
 
   if (newton_residual < lower_bound_newton_residual)
     {
-      std::cout << '\t' << std::scientific << newton_residual << std::endl;
+      pcout << '\t' << std::scientific << newton_residual << std::endl;
     }
 
   while (newton_residual > lower_bound_newton_residual &&
@@ -2527,7 +2575,11 @@ FSI_PU_DWR_Problem<dim>::newton_iteration_primal()
     {
       timer_newton.start();
       old_newton_residual = newton_residual;
-      old_solution_norm   = solution_primal.linfty_norm();
+
+      // TODO: Its quite expensive to compute this norm, as it requires a lot of
+      // communication
+      linearization_point = solution_primal;
+      old_solution_norm   = linearization_point.linfty_norm();
 
       assemble_rhs_primal();
       newton_residual = system_rhs_primal.linfty_norm();
@@ -2536,57 +2588,61 @@ FSI_PU_DWR_Problem<dim>::newton_iteration_primal()
           (newton_residual / initial_residual <
            lower_bound_newton_residual_relative))
         {
-          std::cout << '\t' << std::scientific << newton_residual << '\t'
-                    << std::scientific << newton_residual / initial_residual
-                    << '\t' << std::endl;
+          pcout << '\t' << std::scientific << newton_residual << '\t'
+                << std::scientific << newton_residual / initial_residual << '\t'
+                << std::endl;
           break;
         }
 
       if (newton_residual / old_newton_residual > nonlinear_rho)
         {
           assemble_matrix_primal();
+
           // Only factorize when matrix is re-built
-          A_direct_primal.factorize(system_matrix_primal);
+          // A_direct_primal.factorize(system_matrix_primal);
         }
 
       // Solve Ax = b
       solve_primal();
 
-      line_search_step = 0;
+      linearization_point = solution_primal;
+      line_search_step    = 0;
       for (; line_search_step < max_no_line_search_steps; ++line_search_step)
         {
-          solution_primal += newton_update_primal;
+          linearization_point += newton_update_primal;
 
+          // cast back the linearization_point onto the
+          // read-only solution vector
+          solution_primal = linearization_point;
           assemble_rhs_primal();
           new_newton_residual = system_rhs_primal.linfty_norm();
 
           if (new_newton_residual < newton_residual)
             break;
           else
-            solution_primal -= newton_update_primal;
+            linearization_point -= newton_update_primal;
 
           newton_update_primal *= line_search_damping;
         }
 
       timer_newton.stop();
 
-      solution_norm = solution_primal.linfty_norm();
+      solution_norm = linearization_point.linfty_norm();
 
-      std::cout << std::setprecision(5) << newton_step << '\t'
-                << std::scientific << newton_residual << '\t' << std::scientific
-                << newton_residual / initial_residual << '\t' << std::scientific
-                << std::abs(solution_norm - old_solution_norm) << '\t'
-                << std::scientific
-                << std::abs(solution_norm - old_solution_norm) /
-                     old_solution_norm
-                << '\t' << std::scientific
-                << newton_residual / old_newton_residual << '\t';
+      pcout << std::setprecision(5) << newton_step << '\t' << std::scientific
+            << newton_residual << '\t' << std::scientific
+            << newton_residual / initial_residual << '\t' << std::scientific
+            << std::abs(solution_norm - old_solution_norm) << '\t'
+            << std::scientific
+            << std::abs(solution_norm - old_solution_norm) / old_solution_norm
+            << '\t' << std::scientific << newton_residual / old_newton_residual
+            << '\t';
       if (newton_residual / old_newton_residual > nonlinear_rho)
-        std::cout << "r" << '\t';
+        pcout << "r" << '\t';
       else
-        std::cout << " " << '\t';
-      std::cout << line_search_step << '\t' << std::scientific
-                << timer_newton.cpu_time() << std::endl;
+        pcout << " " << '\t';
+      pcout << line_search_step << '\t' << std::scientific
+            << timer_newton.cpu_time() << std::endl;
 
 
       // Updates
@@ -2595,8 +2651,8 @@ FSI_PU_DWR_Problem<dim>::newton_iteration_primal()
     }
 
   timer_newton_global.stop();
-  std::cout << "Wall time solving primal system:  "
-            << timer_newton_global.cpu_time() << std::endl;
+  pcout << "Wall time solving primal system:  "
+        << timer_newton_global.cpu_time() << std::endl;
   timer_newton_global.reset();
 }
 
@@ -2624,76 +2680,64 @@ FSI_PU_DWR_Problem<dim>::setup_system_adjoint()
   // velocity in x and y:                0
   // structure displacement in x and y:  1
   // scalar pressure field:              2
-  std::vector<unsigned int> block_component(5, 0);
-  block_component[dim]       = 1;
-  block_component[dim + 1]   = 1;
-  block_component[dim + dim] = 2;
+  // std::vector<unsigned int> block_component(5, 0);
+  // block_component[dim]       = 1;
+  // block_component[dim + 1]   = 1;
+  // block_component[dim + dim] = 2;
 
-  DoFRenumbering::component_wise(dof_handler_adjoint, block_component);
+  // DoFRenumbering::component_wise(dof_handler_adjoint, block_component);
+  //
+  // Get the working index sets:
+  // locally_owned_dofs stores a one-to-one map of all dofs, and holds
+  //                    the dofs that belong to this rank.
+  // locally_relevant_dofs contains the locally_owned_dofs and also some
+  //                    dofs that do belong to other ranks but are relevant
+  //                    for the rank.
+  locally_owned_dofs_adjoint = dof_handler_adjoint.locally_owned_dofs();
+  locally_relevant_dofs_adjoint =
+    DoFTools::extract_locally_relevant_dofs(dof_handler_adjoint);
 
   {
     constraints_adjoint.clear();
+    constraints_adjoint.reinit(locally_owned_dofs_adjoint,
+                               locally_relevant_dofs_adjoint);
+    set_bc_adjoint();
     DoFTools::make_hanging_node_constraints(dof_handler_adjoint,
                                             constraints_adjoint);
-    set_bc_adjoint();
+    constraints_adjoint.close();
   }
-  constraints_adjoint.close();
 
-  std::vector<types::global_dof_index> dofs_per_block(3);
-  dofs_per_block =
-    DoFTools::count_dofs_per_fe_block(dof_handler_adjoint, block_component);
-  const unsigned int n_v = dofs_per_block[0], n_u = dofs_per_block[1],
-                     n_p = dofs_per_block[2];
-
-  std::cout << "DoFs (adjoint):\t" << dof_handler_adjoint.n_dofs() << " ("
-            << n_v << '+' << n_u << '+' << n_p << ')' << std::endl;
-
-
+  pcout << "DoFs (adjoint):\t" << dof_handler_adjoint.n_dofs() << std::endl;
 
   {
-    BlockDynamicSparsityPattern csp(3, 3);
-
-    csp.block(0, 0).reinit(n_v, n_v);
-    csp.block(0, 1).reinit(n_v, n_u);
-    csp.block(0, 2).reinit(n_v, n_p);
-
-    csp.block(1, 0).reinit(n_u, n_v);
-    csp.block(1, 1).reinit(n_u, n_u);
-    csp.block(1, 2).reinit(n_u, n_p);
-
-    csp.block(2, 0).reinit(n_p, n_v);
-    csp.block(2, 1).reinit(n_p, n_u);
-    csp.block(2, 2).reinit(n_p, n_p);
-
-    csp.collect_sizes();
-
+    DynamicSparsityPattern dsp_adjoint(locally_relevant_dofs_adjoint);
 
     DoFTools::make_sparsity_pattern(dof_handler_adjoint,
-                                    csp,
+                                    dsp_adjoint,
                                     constraints_adjoint,
                                     false);
+    SparsityTools::distribute_sparsity_pattern(
+      dsp_adjoint,
+      dof_handler_adjoint.locally_owned_dofs(),
+      mpi_communicator,
+      locally_relevant_dofs_adjoint);
 
-    sparsity_pattern_adjoint.copy_from(csp);
+    system_matrix_adjoint.reinit(locally_owned_dofs_adjoint,
+                                 locally_owned_dofs_adjoint,
+                                 dsp_adjoint,
+                                 mpi_communicator);
   }
 
-  system_matrix_adjoint.reinit(sparsity_pattern_adjoint);
-
   // Current solution
-  solution_adjoint.reinit(3);
-  solution_adjoint.block(0).reinit(n_v);
-  solution_adjoint.block(1).reinit(n_u);
-  solution_adjoint.block(2).reinit(n_p);
-
-  solution_adjoint.collect_sizes();
-
+  solution_adjoint.reinit(locally_owned_dofs_adjoint,
+                          locally_relevant_dofs_adjoint,
+                          mpi_communicator);
 
   // Residual for  Newton's method
-  system_rhs_adjoint.reinit(3);
-  system_rhs_adjoint.block(0).reinit(n_v);
-  system_rhs_adjoint.block(1).reinit(n_u);
-  system_rhs_adjoint.block(2).reinit(n_p);
-
-  system_rhs_adjoint.collect_sizes();
+  system_rhs_adjoint.reinit(locally_owned_dofs_adjoint,
+                            locally_relevant_dofs_adjoint,
+                            mpi_communicator,
+                            true);
 }
 
 
@@ -2741,6 +2785,7 @@ FSI_PU_DWR_Problem<dim>::assemble_matrix_adjoint()
   const unsigned int n_q_points      = quadrature_formula.size();
   const unsigned int n_face_q_points = face_quadrature_formula.size();
 
+  Vector<double>     local_rhs(dofs_per_cell);
   FullMatrix<double> local_matrix(dofs_per_cell, dofs_per_cell);
 
   std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
@@ -2803,9 +2848,19 @@ FSI_PU_DWR_Problem<dim>::assemble_matrix_adjoint()
 
   for (const auto &cell : dof_handler_adjoint.active_cell_iterators())
     {
+      if (!cell->is_locally_owned())
+        {
+          // update primal cell
+          ++cell_primal;
+
+          // skip not locally owned cells
+          continue;
+        }
+
       fe_values.reinit(cell);
       fe_values_primal.reinit(cell_primal);
 
+      local_rhs    = 0;
       local_matrix = 0;
 
       // We need the cell diameter to control the fluid mesh motion
@@ -3092,14 +3147,6 @@ FSI_PU_DWR_Problem<dim>::assemble_matrix_adjoint()
               // end face integrals do-nothing
             }
 
-
-
-          // This is the same as discussed in step-22:
-          cell->get_dof_indices(local_dof_indices);
-          constraints_adjoint.distribute_local_to_global(local_matrix,
-                                                         local_dof_indices,
-                                                         system_matrix_adjoint);
-
           // Finally, we arrive at the end for assembling the matrix
           // for the fluid equations and step to the computation of the
           // structure terms:
@@ -3190,20 +3237,22 @@ FSI_PU_DWR_Problem<dim>::assemble_matrix_adjoint()
               // end n_q_points
             }
 
-
-          cell->get_dof_indices(local_dof_indices);
-          constraints_adjoint.distribute_local_to_global(local_matrix,
-                                                         local_dof_indices,
-                                                         system_matrix_adjoint);
-
-
-
         } // end if (second PDE: STVK material)
-          // end cell
+
+      cell->get_dof_indices(local_dof_indices);
+      constraints_adjoint.distribute_local_to_global(local_matrix,
+                                                     local_rhs,
+                                                     local_dof_indices,
+                                                     system_matrix_adjoint,
+                                                     system_rhs_adjoint);
 
       // update primal cell
       ++cell_primal;
+
+      // end cell
     }
+
+  system_matrix_adjoint.compress(VectorOperation::add);
 }
 
 
@@ -3214,6 +3263,10 @@ void
 FSI_PU_DWR_Problem<dim>::assemble_rhs_adjoint_drag()
 {
   TimerOutput::Scope t(timer, "Assemble adjoint rhs.");
+  system_rhs_adjoint.reinit(locally_owned_dofs_adjoint,
+                            locally_relevant_dofs_adjoint,
+                            mpi_communicator,
+                            true);
   system_rhs_adjoint = 0;
 
   // Info: Quadrature degree must be sufficiently high
@@ -3237,7 +3290,8 @@ FSI_PU_DWR_Problem<dim>::assemble_rhs_adjoint_drag()
   // const unsigned int   n_q_points      = quadrature_formula.size();
   const unsigned int n_face_q_points = face_quadrature_formula.size();
 
-  Vector<double> local_rhs(dofs_per_cell);
+  Vector<double>     local_rhs(dofs_per_cell);
+  FullMatrix<double> local_matrix(dofs_per_cell, dofs_per_cell);
 
   std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
 
@@ -3250,8 +3304,12 @@ FSI_PU_DWR_Problem<dim>::assemble_rhs_adjoint_drag()
   Tensor<1, 2> drag_lift_value;
   for (const auto &cell : dof_handler_adjoint.active_cell_iterators())
     {
+      if (!cell->is_locally_owned())
+        continue;
+
       fe_values.reinit(cell);
-      local_rhs = 0;
+      local_rhs    = 0;
+      local_matrix = 0;
 
       // Again, material_id == 0 corresponds to
       // the domain for fluid equations
@@ -3452,12 +3510,6 @@ FSI_PU_DWR_Problem<dim>::assemble_rhs_adjoint_drag()
 
             } // end mat id 0
 
-
-          cell->get_dof_indices(local_dof_indices);
-          constraints_adjoint.distribute_local_to_global(local_rhs,
-                                                         local_dof_indices,
-                                                         system_rhs_adjoint);
-
           // Finally, we arrive at the end for assembling
           // the variational formulation for the fluid part and step to
           // the assembling process of the structure terms:
@@ -3469,7 +3521,15 @@ FSI_PU_DWR_Problem<dim>::assemble_rhs_adjoint_drag()
           // abort();
         }
 
+      cell->get_dof_indices(local_dof_indices);
+      constraints_adjoint.distribute_local_to_global(local_matrix,
+                                                     local_rhs,
+                                                     local_dof_indices,
+                                                     system_matrix_adjoint,
+                                                     system_rhs_adjoint);
     } // end cell
+
+  system_rhs_adjoint.compress(VectorOperation::add);
 }
 
 
@@ -3478,6 +3538,10 @@ void
 FSI_PU_DWR_Problem<dim>::assemble_rhs_adjoint_pressure_point()
 {
   TimerOutput::Scope t(timer, "Assemble adjoint rhs.");
+  system_rhs_adjoint.reinit(locally_owned_dofs_adjoint,
+                            locally_relevant_dofs_adjoint,
+                            mpi_communicator,
+                            true);
   system_rhs_adjoint = 0;
 
   Point<dim> evaluation_point(0.15, 0.2);
@@ -3487,6 +3551,9 @@ FSI_PU_DWR_Problem<dim>::assemble_rhs_adjoint_pressure_point()
     for (unsigned int vertex = 0; vertex < GeometryInfo<dim>::vertices_per_cell;
          ++vertex)
       {
+        if (!cell->is_locally_owned())
+          continue;
+
         if (cell->vertex(vertex).distance(evaluation_point) <
             cell->diameter() * 1e-8)
           {
@@ -3517,6 +3584,10 @@ void
 FSI_PU_DWR_Problem<dim>::assemble_rhs_adjoint_displacement_point()
 {
   TimerOutput::Scope t(timer, "Assemble adjoint rhs.");
+  system_rhs_adjoint.reinit(locally_owned_dofs_adjoint,
+                            locally_relevant_dofs_adjoint,
+                            mpi_communicator,
+                            true);
   system_rhs_adjoint = 0;
 
   Point<dim> evaluation_point(0.6, 0.2);
@@ -3525,6 +3596,9 @@ FSI_PU_DWR_Problem<dim>::assemble_rhs_adjoint_displacement_point()
     for (unsigned int vertex = 0; vertex < GeometryInfo<dim>::vertices_per_cell;
          ++vertex)
       {
+        if (!cell->is_locally_owned())
+          continue;
+
         if (cell->vertex(vertex).distance(evaluation_point) <
             cell->diameter() * 1e-8)
           {
@@ -3614,6 +3688,16 @@ FSI_PU_DWR_Problem<dim>::solve_adjoint()
   //  more or less as copy and paste from the assemble_matrix_primal function
   assemble_matrix_adjoint();
 
+  // The solution vector is read-only. Therefore, we need
+  // to create a vector with write access first, and
+  // cast the solution onto it.
+  LinearAlgebra::TpetraWrappers::Vector<double> completely_distributed_solution(
+    locally_owned_dofs_primal,
+    locally_relevant_dofs_primal,
+    mpi_communicator,
+    true);
+
+
   // The rhs depends on the specific goal functional
   if (adjoint_rhs == "drag")
     assemble_rhs_adjoint_drag();
@@ -3631,21 +3715,27 @@ FSI_PU_DWR_Problem<dim>::solve_adjoint()
 
   // Linear solution
   TimerOutput::Scope t(timer, "Solve linear adjoint system.");
-  Vector<double>     sol, rhs;
-  sol = solution_adjoint;
-  rhs = system_rhs_adjoint;
 
-  SparseDirectUMFPACK A_direct;
-  A_direct.factorize(system_matrix_adjoint);
+  // create the solver_control object
+  SolverControl solver_control(dof_handler_adjoint.n_dofs(), 1e-12);
 
-  A_direct.vmult(sol, rhs);
-  solution_adjoint = sol;
+  LinearAlgebra::TpetraWrappers::SolverDirect<double>::AdditionalData
+    additional_data("UMFPACK");
+
+  LinearAlgebra::TpetraWrappers::SolverDirect<double> A_direct_adjoint(
+    solver_control, additional_data);
+
+  A_direct_adjoint.initialize(system_matrix_adjoint);
+
+  A_direct_adjoint.solve(completely_distributed_solution, system_rhs_adjoint);
+
+  solution_adjoint = completely_distributed_solution;
 
   constraints_adjoint.distribute(solution_adjoint);
   timer_solve_adjoint.stop();
 
-  std::cout << "Wall time solving adjoint system: "
-            << timer_solve_adjoint.cpu_time() << std::endl;
+  pcout << "Wall time solving adjoint system: "
+        << timer_solve_adjoint.cpu_time() << std::endl;
 
   timer_solve_adjoint.reset();
 }
@@ -3761,10 +3851,10 @@ FSI_PU_DWR_Problem<dim>::output_results(
 
   std::ostringstream filename;
 
-  std::cout << "------------------" << std::endl;
-  std::cout << "Write solution" << std::endl;
-  std::cout << "------------------" << std::endl;
-  std::cout << std::endl;
+  pcout << "------------------" << std::endl;
+  pcout << "Write solution" << std::endl;
+  pcout << "------------------" << std::endl;
+  pcout << std::endl;
   filename << filename_basis << Utilities::int_to_string(refinement_cycle, 5)
            << ".vtk";
 
@@ -3954,10 +4044,10 @@ FSI_PU_DWR_Problem<dim>::compute_drag_lift_fsi_fluid_tensor()
   if (test_case == "2D-1")
     drag_lift_value *= 500.0;
 
-  std::cout << "Face drag:   " << "   " << std::setprecision(16)
-            << drag_lift_value[0] << std::endl;
-  std::cout << "Face lift:   " << "   " << std::setprecision(16)
-            << drag_lift_value[1] << std::endl;
+  pcout << "Face drag:   " << "   " << std::setprecision(16)
+        << drag_lift_value[0] << std::endl;
+  pcout << "Face lift:   " << "   " << std::setprecision(16)
+        << drag_lift_value[1] << std::endl;
 
   if (test_case == "2D-1")
     {
@@ -4345,7 +4435,6 @@ FSI_PU_DWR_Problem<dim>::compute_drag_lift_fsi_fluid_tensor_domain_structure()
                                            boundary_values,
                                            component_mask);
 
-
   value = 0.;
 
   for (std::map<types::global_dof_index, double>::const_iterator p =
@@ -4400,7 +4489,7 @@ FSI_PU_DWR_Problem<dim>::compute_minimal_J()
         }
     }
 
-  std::cout << "Min J: " << "   " << min_J << std::endl;
+  pcout << "Min J: " << "   " << min_J << std::endl;
 }
 
 
@@ -4446,16 +4535,14 @@ FSI_PU_DWR_Problem<dim>::compute_functional_values()
     }
 
 
-  std::cout << "------------------" << std::endl;
-  std::cout << "DisX  :  " << "   " << std::setprecision(16) << x1 << std::endl;
-  std::cout << "DisY  :  " << "   " << std::setprecision(16) << y1 << std::endl;
-  std::cout << "P-Diff:  " << "   " << std::setprecision(16) << p_diff
-            << std::endl;
-  std::cout << "P-front: " << "   " << std::setprecision(16) << p_front
-            << std::endl;
-  std::cout << "P-back:  " << "   " << std::setprecision(16) << p_back
-            << std::endl;
-  std::cout << "------------------" << std::endl;
+  pcout << "------------------" << std::endl;
+  pcout << "DisX  :  " << "   " << std::setprecision(16) << x1 << std::endl;
+  pcout << "DisY  :  " << "   " << std::setprecision(16) << y1 << std::endl;
+  pcout << "P-Diff:  " << "   " << std::setprecision(16) << p_diff << std::endl;
+  pcout << "P-front: " << "   " << std::setprecision(16) << p_front
+        << std::endl;
+  pcout << "P-back:  " << "   " << std::setprecision(16) << p_back << std::endl;
+  pcout << "------------------" << std::endl;
 
   // Compute drag and lift via line integral
   compute_drag_lift_fsi_fluid_tensor();
@@ -4464,12 +4551,12 @@ FSI_PU_DWR_Problem<dim>::compute_functional_values()
   global_drag_lift_value = 0.0;
   compute_drag_lift_fsi_fluid_tensor_domain();
   compute_drag_lift_fsi_fluid_tensor_domain_structure();
-  std::cout << "Domain drag: " << "   " << global_drag_lift_value << std::endl;
+  pcout << "Domain drag: " << "   " << global_drag_lift_value << std::endl;
 
-  std::cout << "------------------" << std::endl;
+  pcout << "------------------" << std::endl;
   compute_minimal_J();
 
-  std::cout << std::endl;
+  pcout << std::endl;
 }
 
 
@@ -4506,470 +4593,478 @@ double
 FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
   const unsigned int refinement_cycle)
 {
-  // First, we re-initialize the error indicator vector that
-  // has the length of the space dimension of the PU-FE.
-  // Therein we store the local errors at all degrees of freedom.
-  // This is in contrast to usual procedures, where the error
-  // in general is stored cell-wise.
-  dof_handler_pou.distribute_dofs(fe_pou);
-  error_indicators.reinit(dof_handler_pou.n_dofs());
-
-
-  // Block 1 (building the dual weights):
-  // In the following the very specific
-  // part (z-I_hz) of DWR is implemented.
-  // This part is the same for classical error estimation
-  // and PU error estimation.
-  std::vector<unsigned int> block_component(5, 0);
-  block_component[dim]       = 1;
-  block_component[dim + 1]   = 1;
-  block_component[dim + dim] = 2;
-
-
-  DoFRenumbering::component_wise(dof_handler_adjoint, block_component);
-
-  // Implement the interpolation operator
-  // (z-z_h)=(z-I_hz)
-  AffineConstraints<double> dual_hanging_node_constraints;
-  DoFTools::make_hanging_node_constraints(dof_handler_adjoint,
-                                          dual_hanging_node_constraints);
-  dual_hanging_node_constraints.close();
-
-  AffineConstraints<double> primal_hanging_node_constraints;
-  DoFTools::make_hanging_node_constraints(dof_handler_primal,
-                                          primal_hanging_node_constraints);
-  primal_hanging_node_constraints.close();
-
-
-  // TODO double-check (3), 0 , 1, 2 since
-  // in the previous code only FSI was implemented
-  // Construct a local primal solution that
-  // has the length of the adjoint vector
-  std::vector<types::global_dof_index> dofs_per_block(3);
-  dofs_per_block =
-    DoFTools::count_dofs_per_fe_block(dof_handler_adjoint, block_component);
-  const unsigned int n_v = dofs_per_block[0];
-  const unsigned int n_u = dofs_per_block[1];
-  const unsigned int n_p = dofs_per_block[2];
-
-
-  BlockVector<double> solution_primal_of_adjoint_length;
-  solution_primal_of_adjoint_length.reinit(3);
-  solution_primal_of_adjoint_length.block(0).reinit(n_v);
-  solution_primal_of_adjoint_length.block(1).reinit(n_u);
-  solution_primal_of_adjoint_length.block(2).reinit(n_p);
-  solution_primal_of_adjoint_length.collect_sizes();
-
-  // Main function 1: Interpolate cell-wise the
-  // primal solution into the dual FE space.
-  // This rescaled primal solution is called
-  //   ** solution_primal_of_adjoint_length **
-  FETools::interpolate(dof_handler_primal,
-                       solution_primal,
-                       dof_handler_adjoint,
-                       dual_hanging_node_constraints,
-                       solution_primal_of_adjoint_length);
-
-
-
-  // Local vectors of dual weights obtained
-  // from the adjoint solution
-  BlockVector<double> dual_weights;
-  dual_weights.reinit(3);
-  dual_weights.block(0).reinit(n_v);
-  dual_weights.block(1).reinit(n_u);
-  dual_weights.block(2).reinit(n_p);
-  dual_weights.collect_sizes();
-
-  // Main function 2: Execute (z-I_hz) (in the dual space),
-  // yielding the adjoint weights for error estimation.
-  FETools::interpolation_difference(dof_handler_adjoint,
-                                    dual_hanging_node_constraints,
-                                    solution_adjoint,
-                                    dof_handler_primal,
-                                    primal_hanging_node_constraints,
-                                    dual_weights);
-
-  // end Block 1
-
-
-  // Block 2 (evaluating the PU-DWR):
-  // The following function has a loop inside that
-  // goes over all cells to collect the error contributions,
-  // and is the `heart' of the DWR method. Therein
-  // the specific equation of the error estimator is implemented.
-
-
-  // Info: must be sufficiently high for adjoint evaluations
-  QGauss<dim> quadrature_formula(5);
-
-  FEValues<dim> fe_values_pou(fe_pou,
-                              quadrature_formula,
-                              update_values | update_quadrature_points |
-                                update_JxW_values | update_gradients);
-
-
-  FEValues<dim> fe_values_adjoint(fe_adjoint,
-                                  quadrature_formula,
-                                  update_values | update_quadrature_points |
-                                    update_JxW_values | update_gradients);
-
-
-  const unsigned int dofs_per_cell = fe_values_pou.dofs_per_cell;
-  const unsigned int n_q_points    = fe_values_pou.n_quadrature_points;
-
-  Vector<double> local_err_ind(dofs_per_cell);
-
-  std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
-
-
-
-  const FEValuesExtractors::Vector velocities(0);       // 0
-  const FEValuesExtractors::Vector displacements(dim);  // 2
-  const FEValuesExtractors::Scalar pressure(dim + dim); // 4
-
-  const FEValuesExtractors::Scalar pou_extract(0);
-
-
-  std::vector<Vector<double>> primal_cell_values(n_q_points,
-                                                 Vector<double>(dim + dim + 1));
-
-  std::vector<std::vector<Tensor<1, dim>>> primal_cell_gradients(
-    n_q_points, std::vector<Tensor<1, dim>>(dim + dim + 1));
-
-  std::vector<Vector<double>> dual_weights_values(n_q_points,
-                                                  Vector<double>(dim + dim +
-                                                                 1));
-
-  std::vector<std::vector<Tensor<1, dim>>> dual_weights_gradients(
-    n_q_points, std::vector<Tensor<1, dim>>(dim + dim + 1));
-
-  const Tensor<2, dim> Identity = ALE_Transformations ::get_Identity<dim>();
-
-  typename DoFHandler<dim>::active_cell_iterator cell_adjoint =
-    dof_handler_adjoint.begin_active();
-
-  for (const auto &cell : dof_handler_pou.active_cell_iterators())
-    {
-      fe_values_pou.reinit(cell);
-      fe_values_adjoint.reinit(cell_adjoint);
-
-      local_err_ind = 0;
-
-
-      // primal solution (cell residuals)
-      // But we use the adjoint FE since we previously enlarged the
-      // primal solution to the length of the adjoint vector.
-      fe_values_adjoint.get_function_values(solution_primal_of_adjoint_length,
-                                            primal_cell_values);
-
-      fe_values_adjoint.get_function_gradients(
-        solution_primal_of_adjoint_length, primal_cell_gradients);
-
-      // adjoint weights
-      fe_values_adjoint.get_function_values(dual_weights, dual_weights_values);
-
-      fe_values_adjoint.get_function_gradients(dual_weights,
-                                               dual_weights_gradients);
-
-
-
-      // Gather local error indicators while running
-      // of the degrees of freedom of the partition of unity
-      // and corresponding quadrature points.
-      for (unsigned int q = 0; q < n_q_points; ++q)
-        {
-          // Right hand side
-          Tensor<1, dim> fluid_force;
-          fluid_force.clear();
-          fluid_force[0] = density_fluid * force_fluid_x;
-          fluid_force[1] = density_fluid * force_fluid_y;
-
-          // Primal cell values
-          Tensor<2, dim> pI;
-          pI[0][0] = primal_cell_values[q](4);
-          pI[1][1] = primal_cell_values[q](4);
-
-          Tensor<1, 2> v;
-          v.clear();
-          v[0] = primal_cell_values[q](0);
-          v[1] = primal_cell_values[q](1);
-
-          Tensor<2, dim> grad_v;
-          grad_v[0][0] = primal_cell_gradients[q][0][0];
-          grad_v[0][1] = primal_cell_gradients[q][0][1];
-          grad_v[1][0] = primal_cell_gradients[q][1][0];
-          grad_v[1][1] = primal_cell_gradients[q][1][1];
-
-          const Tensor<2, dim> grad_v_T =
-            ALE_Transformations ::get_grad_v_T<dim>(grad_v);
-
-          Tensor<2, dim> grad_u;
-          grad_u[0][0] = primal_cell_gradients[q][2][0];
-          grad_u[0][1] = primal_cell_gradients[q][2][1];
-          grad_u[1][0] = primal_cell_gradients[q][3][0];
-          grad_u[1][1] = primal_cell_gradients[q][3][1];
-
-
-          const Tensor<2, dim> F = Identity + grad_u;
-
-          const Tensor<2, dim> F_T = ALE_Transformations ::get_F_T<dim>(F);
-
-          const Tensor<2, dim> F_Inverse =
-            ALE_Transformations ::get_F_Inverse<dim>(F);
-
-          const Tensor<2, dim> F_Inverse_T =
-            ALE_Transformations ::get_F_Inverse_T<dim>(F_Inverse);
-
-          const double J = ALE_Transformations ::get_J<dim>(F);
-
-
-          // Adjoint weights
-          Tensor<1, dim> dw_v;
-          dw_v[0] = dual_weights_values[q](0);
-          dw_v[1] = dual_weights_values[q](1);
-
-          double dw_p = dual_weights_values[q](4);
-
-          Tensor<2, dim> grad_dw_v;
-          grad_dw_v[0][0] = dual_weights_gradients[q][0][0];
-          grad_dw_v[0][1] = dual_weights_gradients[q][0][1];
-          grad_dw_v[1][0] = dual_weights_gradients[q][1][0];
-          grad_dw_v[1][1] = dual_weights_gradients[q][1][1];
-
-          Tensor<2, dim> grad_dw_u;
-          grad_dw_u[0][0] = dual_weights_gradients[q][2][0];
-          grad_dw_u[0][1] = dual_weights_gradients[q][2][1];
-          grad_dw_u[1][0] = dual_weights_gradients[q][3][0];
-          grad_dw_u[1][1] = dual_weights_gradients[q][3][1];
-
-
-
-          // Fluid
-          const Tensor<2, dim> sigma_ALE =
-            NSE_in_ALE ::get_stress_fluid_except_pressure_ALE<dim>(
-              density_fluid,
-              viscosity,
-              grad_v,
-              grad_v_T,
-              F_Inverse,
-              F_Inverse_T);
-
-          Tensor<2, dim> stress_fluid;
-          stress_fluid.clear();
-          stress_fluid = (J * sigma_ALE * F_Inverse_T);
-
-          Tensor<2, dim> fluid_pressure;
-          fluid_pressure.clear();
-          fluid_pressure = (-pI * J * F_Inverse_T);
-
-          const double incompressiblity_fluid =
-            NSE_in_ALE ::get_Incompressibility_ALE<dim>(q,
-                                                        primal_cell_gradients);
-
-          Tensor<1, dim> convection_fluid;
-          convection_fluid.clear();
-          convection_fluid = density_fluid * J * (grad_v * F_Inverse * v);
-
-
-
-          // Solid (STVK structure model)
-          const Tensor<2, dim> E =
-            Structure_Terms_in_ALE ::get_E<dim>(F_T, F, Identity);
-
-          const double tr_E = Structure_Terms_in_ALE ::get_tr_E<dim>(E);
-
-          Tensor<2, dim> sigma_structure_ALE;
-          sigma_structure_ALE.clear();
-          sigma_structure_ALE = (1.0 / J * F *
-                                 (lame_coefficient_lambda * tr_E * Identity +
-                                  2 * lame_coefficient_mu * E) *
-                                 F_T);
-
-          Tensor<2, dim> stress_term_solid;
-          stress_term_solid.clear();
-          stress_term_solid = (J * sigma_structure_ALE * F_Inverse_T);
-
-
-          // Run over all PU degrees of freedom per cell (namely 4 DoFs for Q1
-          // FE-PU)
-          for (unsigned int i = 0; i < dofs_per_cell; ++i)
-            {
-              Tensor<2, dim> grad_phi_psi_v;
-              grad_phi_psi_v[0][0] =
-                fe_values_pou[pou_extract].value(i, q) * grad_dw_v[0][0] +
-                dw_v[0] * fe_values_pou[pou_extract].gradient(i, q)[0];
-              grad_phi_psi_v[0][1] =
-                fe_values_pou[pou_extract].value(i, q) * grad_dw_v[0][1] +
-                dw_v[0] * fe_values_pou[pou_extract].gradient(i, q)[1];
-              grad_phi_psi_v[1][0] =
-                fe_values_pou[pou_extract].value(i, q) * grad_dw_v[1][0] +
-                dw_v[1] * fe_values_pou[pou_extract].gradient(i, q)[0];
-              grad_phi_psi_v[1][1] =
-                fe_values_pou[pou_extract].value(i, q) * grad_dw_v[1][1] +
-                dw_v[1] * fe_values_pou[pou_extract].gradient(i, q)[1];
-
-              /*
-          // For MMPDE - but alpha_u is very small ...
-          // Therefore numerically no influence
-              Tensor<2,dim> grad_phi_psi_v;
-              grad_phi_psi_v[0][0] = fe_values_pou[pou_extract].value(i,q) *
-          grad_dw_v[0][0] + dw_v[0] *
-          fe_values_pou[pou_extract].gradient(i,q)[0]; grad_phi_psi_v[0][1] =
-          fe_values_pou[pou_extract].value(i,q) * grad_dw_v[0][1] + dw_v[0] *
-          fe_values_pou[pou_extract].gradient(i,q)[1]; grad_phi_psi_v[1][0] =
-          fe_values_pou[pou_extract].value(i,q) * grad_dw_v[1][0] + dw_v[1] *
-          fe_values_pou[pou_extract].gradient(i,q)[0]; grad_phi_psi_v[1][1] =
-          fe_values_pou[pou_extract].value(i,q) * grad_dw_v[1][1] + dw_v[1] *
-          fe_values_pou[pou_extract].gradient(i,q)[1];
-              */
-
-              // double divergence_phi_psi = grad_dw_v[0][0] *
-              // cell_data.fe_values_pou[pou_extract].value(i,q) + dw_v[0] *
-              // cell_data.fe_values_pou[pou_extract].gradient(i,q)[0]
-              //	+ grad_dw_v[1][1] *
-              // cell_data.fe_values_pou[pou_extract].value(i,q) + dw_v[1] *
-              // cell_data.fe_values_pou[pou_extract].gradient(i,q)[1];
-
-
-
-              // Implement the error estimator
-              // J(u) - J(u_h) \approx \eta := (f,...) - (\nabla u, ...)
-              if (cell->material_id() == 0)
-                {
-                  // First part: (f,...)
-                  local_err_ind(i) += (fluid_force * dw_v *
-                                       fe_values_pou[pou_extract].value(i, q)) *
-                                      fe_values_pou.JxW(q);
-
-                  // Second part: - (\nabla u, ...)
-                  local_err_ind(i) -=
-                    (convection_fluid * dw_v *
-                       fe_values_pou[pou_extract].value(i, q) +
-                     scalar_product(fluid_pressure + stress_fluid,
-                                    grad_phi_psi_v) +
-                     incompressiblity_fluid * dw_p *
-                       fe_values_pou[pou_extract].value(i, q)) *
-                    fe_values_pou.JxW(q);
-                }
-              else if (cell->material_id() == 1)
-                {
-                  local_err_ind(i) -=
-                    (scalar_product(stress_term_solid, grad_phi_psi_v)) *
-                    fe_values_pou.JxW(q);
-                }
-            }
-
-        } // end q_points
-
-
-      // Write all error contributions
-      // in their respective places in the global error vector.
-      cell->get_dof_indices(local_dof_indices);
-      for (unsigned int i = 0; i < dofs_per_cell; ++i)
-        error_indicators(local_dof_indices[i]) += local_err_ind(i);
-
-      // update adjoint cell iterator
-      ++cell_adjoint;
-
-    } // end cell loop for PU FE elements
-
-
-  // Finally, we eliminate and distribute hanging nodes in the error estimator
-  AffineConstraints<double> dual_hanging_node_constraints_pou;
-  DoFTools::make_hanging_node_constraints(dof_handler_pou,
-                                          dual_hanging_node_constraints_pou);
-  dual_hanging_node_constraints_pou.close();
-
-  // Distributing the hanging nodes
-  dual_hanging_node_constraints_pou.condense(error_indicators);
-
-  // Averaging (making the 'solution' continuous)
-  dual_hanging_node_constraints_pou.distribute(error_indicators);
-
-  // end Block 2
-
-
-  // Block 3 (data and terminal print out)
-  DataOut<dim> data_out;
-  data_out.attach_dof_handler(dof_handler_pou);
-  data_out.add_data_vector(error_indicators, "error_ind");
-  data_out.build_patches();
-
-  std::ostringstream filename;
-  filename << "solution_error_indicators_" << refinement_cycle << ".vtk"
-           << std::ends;
-
-  std::ofstream out(filename.str().c_str());
-  data_out.write_vtk(out);
-
-
-  // Print out on terminal
-  std::cout << "------------------" << std::endl;
-  std::cout << std::setiosflags(std::ios::scientific) << std::setprecision(2);
-  std::cout << "   Dofs:                   " << dof_handler_primal.n_dofs()
-            << std::endl;
-  std::cout << "   Exact error:            " << exact_error_local << std::endl;
-  double total_estimated_error = 0.0;
-  for (unsigned int k = 0; k < error_indicators.size(); k++)
-    total_estimated_error += error_indicators(k);
-
-  // Take the absolute of the estimated error.
-  // However, we might check if the signs
-  // of the exact error and the estimated error are the same.
-  total_estimated_error = std::abs(total_estimated_error);
-
-  std::cout << "   Estimated error (prim): " << total_estimated_error
-            << std::endl;
-
-  // From the JCAM paper: compute indicator indices to check
-  // effectivity of error estimator.
-  double total_estimated_error_absolute_values = 0.0;
-  for (unsigned int k = 0; k < error_indicators.size(); k++)
-    total_estimated_error_absolute_values += std::abs(error_indicators(k));
-
-  // "ind" things were mainly for paper with Thomas Richter (Richter/Wick; JCAM,
-  // 2015)
-  //  std::cout << "   Estimated error (ind):  " <<
-  //  total_estimated_error_absolute_values << std::endl;
-
-  std::cout << "   Ieff:                   "
-            << total_estimated_error / exact_error_local << std::endl;
-  // std::cout << "   Iind:                   " <<
-  // total_estimated_error_absolute_values/exact_error_local << std::endl;
-
-
-
-  // Write everything into a file
-  // file.precision(3);
-  file << std::setiosflags(std::ios::scientific) << std::setprecision(2);
-  file << dof_handler_primal.n_dofs() << "\t";
-  file << exact_error_local << "\t";
-  file << total_estimated_error << "\t";
-  file << total_estimated_error_absolute_values << "\t";
-  file << total_estimated_error / exact_error_local << "\t";
-  file << total_estimated_error_absolute_values / exact_error_local << "\n";
-  file.flush();
-
-  // Write everything into a file gnuplot
-  file_gnuplot << std::setiosflags(std::ios::scientific)
-               << std::setprecision(2);
-  // file_gnuplot.precision(3);
-  file_gnuplot << dof_handler_primal.n_dofs() << "\t";
-  file_gnuplot << exact_error_local << "\t";
-  file_gnuplot << total_estimated_error << "\t";
-  file_gnuplot << total_estimated_error_absolute_values << "\n";
-  file_gnuplot.flush();
-
-
-  // end Block 3
-
-
-  // Block 4
-  return total_estimated_error;
-
-
-  // end Block 4
+  //  // First, we re-initialize the error indicator vector that
+  //  // has the length of the space dimension of the PU-FE.
+  //  // Therein we store the local errors at all degrees of freedom.
+  //  // This is in contrast to usual procedures, where the error
+  //  // in general is stored cell-wise.
+  //  dof_handler_pou.distribute_dofs(fe_pou);
+  //  error_indicators.reinit(dof_handler_pou.n_dofs());
+  //
+  //
+  //  // Block 1 (building the dual weights):
+  //  // In the following the very specific
+  //  // part (z-I_hz) of DWR is implemented.
+  //  // This part is the same for classical error estimation
+  //  // and PU error estimation.
+  //  std::vector<unsigned int> block_component(5, 0);
+  //  block_component[dim]       = 1;
+  //  block_component[dim + 1]   = 1;
+  //  block_component[dim + dim] = 2;
+  //
+  //
+  //  DoFRenumbering::component_wise(dof_handler_adjoint, block_component);
+  //
+  //  // Implement the interpolation operator
+  //  // (z-z_h)=(z-I_hz)
+  //  AffineConstraints<double> dual_hanging_node_constraints;
+  //  DoFTools::make_hanging_node_constraints(dof_handler_adjoint,
+  //                                          dual_hanging_node_constraints);
+  //  dual_hanging_node_constraints.close();
+  //
+  //  AffineConstraints<double> primal_hanging_node_constraints;
+  //  DoFTools::make_hanging_node_constraints(dof_handler_primal,
+  //                                          primal_hanging_node_constraints);
+  //  primal_hanging_node_constraints.close();
+  //
+  //
+  //  // TODO double-check (3), 0 , 1, 2 since
+  //  // in the previous code only FSI was implemented
+  //  // Construct a local primal solution that
+  //  // has the length of the adjoint vector
+  //  std::vector<types::global_dof_index> dofs_per_block(3);
+  //  dofs_per_block =
+  //    DoFTools::count_dofs_per_fe_block(dof_handler_adjoint, block_component);
+  //  const unsigned int n_v = dofs_per_block[0];
+  //  const unsigned int n_u = dofs_per_block[1];
+  //  const unsigned int n_p = dofs_per_block[2];
+  //
+  //
+  //  BlockVector<double> solution_primal_of_adjoint_length;
+  //  solution_primal_of_adjoint_length.reinit(3);
+  //  solution_primal_of_adjoint_length.block(0).reinit(n_v);
+  //  solution_primal_of_adjoint_length.block(1).reinit(n_u);
+  //  solution_primal_of_adjoint_length.block(2).reinit(n_p);
+  //  solution_primal_of_adjoint_length.collect_sizes();
+  //
+  //  // Main function 1: Interpolate cell-wise the
+  //  // primal solution into the dual FE space.
+  //  // This rescaled primal solution is called
+  //  //   ** solution_primal_of_adjoint_length **
+  //  FETools::interpolate(dof_handler_primal,
+  //                       solution_primal,
+  //                       dof_handler_adjoint,
+  //                       dual_hanging_node_constraints,
+  //                       solution_primal_of_adjoint_length);
+  //
+  //
+  //
+  //  // Local vectors of dual weights obtained
+  //  // from the adjoint solution
+  //  BlockVector<double> dual_weights;
+  //  dual_weights.reinit(3);
+  //  dual_weights.block(0).reinit(n_v);
+  //  dual_weights.block(1).reinit(n_u);
+  //  dual_weights.block(2).reinit(n_p);
+  //  dual_weights.collect_sizes();
+  //
+  //  // Main function 2: Execute (z-I_hz) (in the dual space),
+  //  // yielding the adjoint weights for error estimation.
+  //  FETools::interpolation_difference(dof_handler_adjoint,
+  //                                    dual_hanging_node_constraints,
+  //                                    solution_adjoint,
+  //                                    dof_handler_primal,
+  //                                    primal_hanging_node_constraints,
+  //                                    dual_weights);
+  //
+  //  // end Block 1
+  //
+  //
+  //  // Block 2 (evaluating the PU-DWR):
+  //  // The following function has a loop inside that
+  //  // goes over all cells to collect the error contributions,
+  //  // and is the `heart' of the DWR method. Therein
+  //  // the specific equation of the error estimator is implemented.
+  //
+  //
+  //  // Info: must be sufficiently high for adjoint evaluations
+  //  QGauss<dim> quadrature_formula(5);
+  //
+  //  FEValues<dim> fe_values_pou(fe_pou,
+  //                              quadrature_formula,
+  //                              update_values | update_quadrature_points |
+  //                                update_JxW_values | update_gradients);
+  //
+  //
+  //  FEValues<dim> fe_values_adjoint(fe_adjoint,
+  //                                  quadrature_formula,
+  //                                  update_values | update_quadrature_points |
+  //                                    update_JxW_values | update_gradients);
+  //
+  //
+  //  const unsigned int dofs_per_cell = fe_values_pou.dofs_per_cell;
+  //  const unsigned int n_q_points    = fe_values_pou.n_quadrature_points;
+  //
+  //  Vector<double> local_err_ind(dofs_per_cell);
+  //
+  //  std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
+  //
+  //
+  //
+  //  const FEValuesExtractors::Vector velocities(0);       // 0
+  //  const FEValuesExtractors::Vector displacements(dim);  // 2
+  //  const FEValuesExtractors::Scalar pressure(dim + dim); // 4
+  //
+  //  const FEValuesExtractors::Scalar pou_extract(0);
+  //
+  //
+  //  std::vector<Vector<double>> primal_cell_values(n_q_points,
+  //                                                 Vector<double>(dim + dim +
+  //                                                 1));
+  //
+  //  std::vector<std::vector<Tensor<1, dim>>> primal_cell_gradients(
+  //    n_q_points, std::vector<Tensor<1, dim>>(dim + dim + 1));
+  //
+  //  std::vector<Vector<double>> dual_weights_values(n_q_points,
+  //                                                  Vector<double>(dim + dim +
+  //                                                                 1));
+  //
+  //  std::vector<std::vector<Tensor<1, dim>>> dual_weights_gradients(
+  //    n_q_points, std::vector<Tensor<1, dim>>(dim + dim + 1));
+  //
+  //  const Tensor<2, dim> Identity = ALE_Transformations ::get_Identity<dim>();
+  //
+  //  typename DoFHandler<dim>::active_cell_iterator cell_adjoint =
+  //    dof_handler_adjoint.begin_active();
+  //
+  //  for (const auto &cell : dof_handler_pou.active_cell_iterators())
+  //    {
+  //      fe_values_pou.reinit(cell);
+  //      fe_values_adjoint.reinit(cell_adjoint);
+  //
+  //      local_err_ind = 0;
+  //
+  //
+  //      // primal solution (cell residuals)
+  //      // But we use the adjoint FE since we previously enlarged the
+  //      // primal solution to the length of the adjoint vector.
+  //      fe_values_adjoint.get_function_values(solution_primal_of_adjoint_length,
+  //                                            primal_cell_values);
+  //
+  //      fe_values_adjoint.get_function_gradients(
+  //        solution_primal_of_adjoint_length, primal_cell_gradients);
+  //
+  //      // adjoint weights
+  //      fe_values_adjoint.get_function_values(dual_weights,
+  //      dual_weights_values);
+  //
+  //      fe_values_adjoint.get_function_gradients(dual_weights,
+  //                                               dual_weights_gradients);
+  //
+  //
+  //
+  //      // Gather local error indicators while running
+  //      // of the degrees of freedom of the partition of unity
+  //      // and corresponding quadrature points.
+  //      for (unsigned int q = 0; q < n_q_points; ++q)
+  //        {
+  //          // Right hand side
+  //          Tensor<1, dim> fluid_force;
+  //          fluid_force.clear();
+  //          fluid_force[0] = density_fluid * force_fluid_x;
+  //          fluid_force[1] = density_fluid * force_fluid_y;
+  //
+  //          // Primal cell values
+  //          Tensor<2, dim> pI;
+  //          pI[0][0] = primal_cell_values[q](4);
+  //          pI[1][1] = primal_cell_values[q](4);
+  //
+  //          Tensor<1, 2> v;
+  //          v.clear();
+  //          v[0] = primal_cell_values[q](0);
+  //          v[1] = primal_cell_values[q](1);
+  //
+  //          Tensor<2, dim> grad_v;
+  //          grad_v[0][0] = primal_cell_gradients[q][0][0];
+  //          grad_v[0][1] = primal_cell_gradients[q][0][1];
+  //          grad_v[1][0] = primal_cell_gradients[q][1][0];
+  //          grad_v[1][1] = primal_cell_gradients[q][1][1];
+  //
+  //          const Tensor<2, dim> grad_v_T =
+  //            ALE_Transformations ::get_grad_v_T<dim>(grad_v);
+  //
+  //          Tensor<2, dim> grad_u;
+  //          grad_u[0][0] = primal_cell_gradients[q][2][0];
+  //          grad_u[0][1] = primal_cell_gradients[q][2][1];
+  //          grad_u[1][0] = primal_cell_gradients[q][3][0];
+  //          grad_u[1][1] = primal_cell_gradients[q][3][1];
+  //
+  //
+  //          const Tensor<2, dim> F = Identity + grad_u;
+  //
+  //          const Tensor<2, dim> F_T = ALE_Transformations ::get_F_T<dim>(F);
+  //
+  //          const Tensor<2, dim> F_Inverse =
+  //            ALE_Transformations ::get_F_Inverse<dim>(F);
+  //
+  //          const Tensor<2, dim> F_Inverse_T =
+  //            ALE_Transformations ::get_F_Inverse_T<dim>(F_Inverse);
+  //
+  //          const double J = ALE_Transformations ::get_J<dim>(F);
+  //
+  //
+  //          // Adjoint weights
+  //          Tensor<1, dim> dw_v;
+  //          dw_v[0] = dual_weights_values[q](0);
+  //          dw_v[1] = dual_weights_values[q](1);
+  //
+  //          double dw_p = dual_weights_values[q](4);
+  //
+  //          Tensor<2, dim> grad_dw_v;
+  //          grad_dw_v[0][0] = dual_weights_gradients[q][0][0];
+  //          grad_dw_v[0][1] = dual_weights_gradients[q][0][1];
+  //          grad_dw_v[1][0] = dual_weights_gradients[q][1][0];
+  //          grad_dw_v[1][1] = dual_weights_gradients[q][1][1];
+  //
+  //          Tensor<2, dim> grad_dw_u;
+  //          grad_dw_u[0][0] = dual_weights_gradients[q][2][0];
+  //          grad_dw_u[0][1] = dual_weights_gradients[q][2][1];
+  //          grad_dw_u[1][0] = dual_weights_gradients[q][3][0];
+  //          grad_dw_u[1][1] = dual_weights_gradients[q][3][1];
+  //
+  //
+  //
+  //          // Fluid
+  //          const Tensor<2, dim> sigma_ALE =
+  //            NSE_in_ALE ::get_stress_fluid_except_pressure_ALE<dim>(
+  //              density_fluid,
+  //              viscosity,
+  //              grad_v,
+  //              grad_v_T,
+  //              F_Inverse,
+  //              F_Inverse_T);
+  //
+  //          Tensor<2, dim> stress_fluid;
+  //          stress_fluid.clear();
+  //          stress_fluid = (J * sigma_ALE * F_Inverse_T);
+  //
+  //          Tensor<2, dim> fluid_pressure;
+  //          fluid_pressure.clear();
+  //          fluid_pressure = (-pI * J * F_Inverse_T);
+  //
+  //          const double incompressiblity_fluid =
+  //            NSE_in_ALE ::get_Incompressibility_ALE<dim>(q,
+  //                                                        primal_cell_gradients);
+  //
+  //          Tensor<1, dim> convection_fluid;
+  //          convection_fluid.clear();
+  //          convection_fluid = density_fluid * J * (grad_v * F_Inverse * v);
+  //
+  //
+  //
+  //          // Solid (STVK structure model)
+  //          const Tensor<2, dim> E =
+  //            Structure_Terms_in_ALE ::get_E<dim>(F_T, F, Identity);
+  //
+  //          const double tr_E = Structure_Terms_in_ALE ::get_tr_E<dim>(E);
+  //
+  //          Tensor<2, dim> sigma_structure_ALE;
+  //          sigma_structure_ALE.clear();
+  //          sigma_structure_ALE = (1.0 / J * F *
+  //                                 (lame_coefficient_lambda * tr_E * Identity
+  //                                 +
+  //                                  2 * lame_coefficient_mu * E) *
+  //                                 F_T);
+  //
+  //          Tensor<2, dim> stress_term_solid;
+  //          stress_term_solid.clear();
+  //          stress_term_solid = (J * sigma_structure_ALE * F_Inverse_T);
+  //
+  //
+  //          // Run over all PU degrees of freedom per cell (namely 4 DoFs for
+  //          Q1
+  //          // FE-PU)
+  //          for (unsigned int i = 0; i < dofs_per_cell; ++i)
+  //            {
+  //              Tensor<2, dim> grad_phi_psi_v;
+  //              grad_phi_psi_v[0][0] =
+  //                fe_values_pou[pou_extract].value(i, q) * grad_dw_v[0][0] +
+  //                dw_v[0] * fe_values_pou[pou_extract].gradient(i, q)[0];
+  //              grad_phi_psi_v[0][1] =
+  //                fe_values_pou[pou_extract].value(i, q) * grad_dw_v[0][1] +
+  //                dw_v[0] * fe_values_pou[pou_extract].gradient(i, q)[1];
+  //              grad_phi_psi_v[1][0] =
+  //                fe_values_pou[pou_extract].value(i, q) * grad_dw_v[1][0] +
+  //                dw_v[1] * fe_values_pou[pou_extract].gradient(i, q)[0];
+  //              grad_phi_psi_v[1][1] =
+  //                fe_values_pou[pou_extract].value(i, q) * grad_dw_v[1][1] +
+  //                dw_v[1] * fe_values_pou[pou_extract].gradient(i, q)[1];
+  //
+  //              /*
+  //          // For MMPDE - but alpha_u is very small ...
+  //          // Therefore numerically no influence
+  //              Tensor<2,dim> grad_phi_psi_v;
+  //              grad_phi_psi_v[0][0] = fe_values_pou[pou_extract].value(i,q) *
+  //          grad_dw_v[0][0] + dw_v[0] *
+  //          fe_values_pou[pou_extract].gradient(i,q)[0]; grad_phi_psi_v[0][1]
+  //          = fe_values_pou[pou_extract].value(i,q) * grad_dw_v[0][1] +
+  //          dw_v[0] * fe_values_pou[pou_extract].gradient(i,q)[1];
+  //          grad_phi_psi_v[1][0] = fe_values_pou[pou_extract].value(i,q) *
+  //          grad_dw_v[1][0] + dw_v[1] *
+  //          fe_values_pou[pou_extract].gradient(i,q)[0]; grad_phi_psi_v[1][1]
+  //          = fe_values_pou[pou_extract].value(i,q) * grad_dw_v[1][1] +
+  //          dw_v[1] * fe_values_pou[pou_extract].gradient(i,q)[1];
+  //              */
+  //
+  //              // double divergence_phi_psi = grad_dw_v[0][0] *
+  //              // cell_data.fe_values_pou[pou_extract].value(i,q) + dw_v[0] *
+  //              // cell_data.fe_values_pou[pou_extract].gradient(i,q)[0]
+  //              //	+ grad_dw_v[1][1] *
+  //              // cell_data.fe_values_pou[pou_extract].value(i,q) + dw_v[1] *
+  //              // cell_data.fe_values_pou[pou_extract].gradient(i,q)[1];
+  //
+  //
+  //
+  //              // Implement the error estimator
+  //              // J(u) - J(u_h) \approx \eta := (f,...) - (\nabla u, ...)
+  //              if (cell->material_id() == 0)
+  //                {
+  //                  // First part: (f,...)
+  //                  local_err_ind(i) += (fluid_force * dw_v *
+  //                                       fe_values_pou[pou_extract].value(i,
+  //                                       q)) *
+  //                                      fe_values_pou.JxW(q);
+  //
+  //                  // Second part: - (\nabla u, ...)
+  //                  local_err_ind(i) -=
+  //                    (convection_fluid * dw_v *
+  //                       fe_values_pou[pou_extract].value(i, q) +
+  //                     scalar_product(fluid_pressure + stress_fluid,
+  //                                    grad_phi_psi_v) +
+  //                     incompressiblity_fluid * dw_p *
+  //                       fe_values_pou[pou_extract].value(i, q)) *
+  //                    fe_values_pou.JxW(q);
+  //                }
+  //              else if (cell->material_id() == 1)
+  //                {
+  //                  local_err_ind(i) -=
+  //                    (scalar_product(stress_term_solid, grad_phi_psi_v)) *
+  //                    fe_values_pou.JxW(q);
+  //                }
+  //            }
+  //
+  //        } // end q_points
+  //
+  //
+  //      // Write all error contributions
+  //      // in their respective places in the global error vector.
+  //      cell->get_dof_indices(local_dof_indices);
+  //      for (unsigned int i = 0; i < dofs_per_cell; ++i)
+  //        error_indicators(local_dof_indices[i]) += local_err_ind(i);
+  //
+  //      // update adjoint cell iterator
+  //      ++cell_adjoint;
+  //
+  //    } // end cell loop for PU FE elements
+  //
+  //
+  //  // Finally, we eliminate and distribute hanging nodes in the error
+  //  estimator AffineConstraints<double> dual_hanging_node_constraints_pou;
+  //  DoFTools::make_hanging_node_constraints(dof_handler_pou,
+  //                                          dual_hanging_node_constraints_pou);
+  //  dual_hanging_node_constraints_pou.close();
+  //
+  //  // Distributing the hanging nodes
+  //  dual_hanging_node_constraints_pou.condense(error_indicators);
+  //
+  //  // Averaging (making the 'solution' continuous)
+  //  dual_hanging_node_constraints_pou.distribute(error_indicators);
+  //
+  //  // end Block 2
+  //
+  //
+  //  // Block 3 (data and terminal print out)
+  //  DataOut<dim> data_out;
+  //  data_out.attach_dof_handler(dof_handler_pou);
+  //  data_out.add_data_vector(error_indicators, "error_ind");
+  //  data_out.build_patches();
+  //
+  //  std::ostringstream filename;
+  //  filename << "solution_error_indicators_" << refinement_cycle << ".vtk"
+  //           << std::ends;
+  //
+  //  std::ofstream out(filename.str().c_str());
+  //  data_out.write_vtk(out);
+  //
+  //
+  //  // Print out on terminal
+  //  std::cout << "------------------" << std::endl;
+  //  std::cout << std::setiosflags(std::ios::scientific) <<
+  //  std::setprecision(2); std::cout << "   Dofs:                   " <<
+  //  dof_handler_primal.n_dofs()
+  //            << std::endl;
+  //  std::cout << "   Exact error:            " << exact_error_local <<
+  //  std::endl; double total_estimated_error = 0.0; for (unsigned int k = 0; k
+  //  < error_indicators.size(); k++)
+  //    total_estimated_error += error_indicators(k);
+  //
+  //  // Take the absolute of the estimated error.
+  //  // However, we might check if the signs
+  //  // of the exact error and the estimated error are the same.
+  //  total_estimated_error = std::abs(total_estimated_error);
+  //
+  //  std::cout << "   Estimated error (prim): " << total_estimated_error
+  //            << std::endl;
+  //
+  //  // From the JCAM paper: compute indicator indices to check
+  //  // effectivity of error estimator.
+  //  double total_estimated_error_absolute_values = 0.0;
+  //  for (unsigned int k = 0; k < error_indicators.size(); k++)
+  //    total_estimated_error_absolute_values += std::abs(error_indicators(k));
+  //
+  //  // "ind" things were mainly for paper with Thomas Richter (Richter/Wick;
+  //  JCAM,
+  //  // 2015)
+  //  //  std::cout << "   Estimated error (ind):  " <<
+  //  //  total_estimated_error_absolute_values << std::endl;
+  //
+  //  std::cout << "   Ieff:                   "
+  //            << total_estimated_error / exact_error_local << std::endl;
+  //  // std::cout << "   Iind:                   " <<
+  //  // total_estimated_error_absolute_values/exact_error_local << std::endl;
+  //
+  //
+  //
+  //  // Write everything into a file
+  //  // file.precision(3);
+  //  file << std::setiosflags(std::ios::scientific) << std::setprecision(2);
+  //  file << dof_handler_primal.n_dofs() << "\t";
+  //  file << exact_error_local << "\t";
+  //  file << total_estimated_error << "\t";
+  //  file << total_estimated_error_absolute_values << "\t";
+  //  file << total_estimated_error / exact_error_local << "\t";
+  //  file << total_estimated_error_absolute_values / exact_error_local << "\n";
+  //  file.flush();
+  //
+  //  // Write everything into a file gnuplot
+  //  file_gnuplot << std::setiosflags(std::ios::scientific)
+  //               << std::setprecision(2);
+  //  // file_gnuplot.precision(3);
+  //  file_gnuplot << dof_handler_primal.n_dofs() << "\t";
+  //  file_gnuplot << exact_error_local << "\t";
+  //  file_gnuplot << total_estimated_error << "\t";
+  //  file_gnuplot << total_estimated_error_absolute_values << "\n";
+  //  file_gnuplot.flush();
+  //
+  //
+  //  // end Block 3
+  //
+  //
+  //  // Block 4
+  //  return total_estimated_error;
+  //
+  //
+  //  // end Block 4
 }
 
 
@@ -5046,29 +5141,29 @@ FSI_PU_DWR_Problem<dim>::run()
   setup_system_primal();
   setup_system_adjoint();
 
-  std::cout << "\n=============================="
-            << "=====================================" << std::endl;
-  std::cout << "Parameters\n"
-            << "==========\n"
-            << "Density fluid:     " << density_fluid << "\n"
-            << "Density structure: " << density_structure << "\n"
-            << "Viscosity fluid:   " << viscosity << "\n"
-            << "alpha_u:           " << alpha_u << "\n"
-            << "Lame coeff. mu:    " << lame_coefficient_mu << "\n"
-            << "TOL primal Newton: " << lower_bound_newton_residual << "\n"
-            << "Max. ref. cycles:  " << max_no_refinement_cycles << "\n"
-            << "Max. number DoFs:  " << max_no_degrees_of_freedom << "\n"
-            << "TOL DWR estimator: " << TOL_DWR_estimator << "\n"
-            << "Goal functional:   " << adjoint_rhs << "\n"
-            << std::endl;
+  pcout << "\n=============================="
+        << "=====================================" << std::endl;
+  pcout << "Parameters\n"
+        << "==========\n"
+        << "Density fluid:     " << density_fluid << "\n"
+        << "Density structure: " << density_structure << "\n"
+        << "Viscosity fluid:   " << viscosity << "\n"
+        << "alpha_u:           " << alpha_u << "\n"
+        << "Lame coeff. mu:    " << lame_coefficient_mu << "\n"
+        << "TOL primal Newton: " << lower_bound_newton_residual << "\n"
+        << "Max. ref. cycles:  " << max_no_refinement_cycles << "\n"
+        << "Max. number DoFs:  " << max_no_degrees_of_freedom << "\n"
+        << "TOL DWR estimator: " << TOL_DWR_estimator << "\n"
+        << "Goal functional:   " << adjoint_rhs << "\n"
+        << std::endl;
 
 
   // Refinement loop
   for (unsigned int cycle = 0; cycle < max_no_refinement_cycles; ++cycle)
     {
-      std::cout << "\n==============================="
-                << "=====================================" << std::endl;
-      std::cout << "Refinement cycle " << cycle << ':' << std::endl;
+      pcout << "\n==============================="
+            << "=====================================" << std::endl;
+      pcout << "Refinement cycle " << cycle << ':' << std::endl;
 
 
 
@@ -5079,7 +5174,7 @@ FSI_PU_DWR_Problem<dim>::run()
 
 
       // Compute goal functional values: dx, dy, drag, lift, pressure values
-      std::cout << std::endl;
+      pcout << std::endl;
       compute_functional_values();
 
 
@@ -5094,11 +5189,11 @@ FSI_PU_DWR_Problem<dim>::run()
           // Use solution transfer to interpolate solution
           // to the next mesh in order to have a better
           // initial guess for the next refinement level.
-          BlockVector<double> tmp_solution_primal;
+          LinearAlgebra::TpetraWrappers::Vector<double> tmp_solution_primal;
           tmp_solution_primal = solution_primal;
 
-          SolutionTransfer<dim, BlockVector<double>> solution_transfer(
-            dof_handler_primal);
+          SolutionTransfer<dim, LinearAlgebra::TpetraWrappers::Vector<double>>
+            solution_transfer(dof_handler_primal);
           solution_transfer.prepare_for_coarsening_and_refinement(
             tmp_solution_primal);
 
@@ -5113,8 +5208,7 @@ FSI_PU_DWR_Problem<dim>::run()
             refine_mesh();
           else
             {
-              std::cout << "No such refinement strategy. Aborting."
-                        << std::endl;
+              pcout << "No such refinement strategy. Aborting." << std::endl;
               abort();
             }
 
@@ -5126,7 +5220,7 @@ FSI_PU_DWR_Problem<dim>::run()
 
           if (estimated_DWR_error < TOL_DWR_estimator)
             {
-              std::cout
+              pcout
                 << "Terminating. Goal functional has sufficient accuracy: \n"
                 << estimated_DWR_error << std::endl;
               break;
@@ -5136,8 +5230,8 @@ FSI_PU_DWR_Problem<dim>::run()
           // Update degrees of freedom after mesh refinement
           if (cycle < max_no_refinement_cycles - 1)
             {
-              std::cout << "\n------------------" << std::endl;
-              std::cout << "Setup DoFs for next refinement cycle:" << std::endl;
+              pcout << "\n------------------" << std::endl;
+              pcout << "Setup DoFs for next refinement cycle:" << std::endl;
 
               setup_system_primal();
 
@@ -5146,8 +5240,8 @@ FSI_PU_DWR_Problem<dim>::run()
                   // Set a sufficiently high number such that enough
                   // computations are done, but the memory of your machine /
                   // cluster is not exceeded.
-                  std::cout << "Terminating because max number DoFs exceeded."
-                            << std::endl;
+                  pcout << "Terminating because max number DoFs exceeded."
+                        << std::endl;
                   break;
                 }
 
@@ -5166,10 +5260,14 @@ FSI_PU_DWR_Problem<dim>::run()
 // The main function looks almost the same
 // as in all other deal.II tuturial steps.
 int
-main()
+main(int argc, char *argv[])
 {
   try
     {
+      dealii::Utilities::MPI::MPI_InitFinalize mpi_initialization(argc,
+                                                                  argv,
+                                                                  1);
+
       deallog.depth_console(0);
 
       FSI_PU_DWR_Problem<2> fsi_pu_dwr_problem("step-fsi.prm");
