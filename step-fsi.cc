@@ -122,6 +122,7 @@
 #include <deal.II/lac/trilinos_tpetra_solver_direct.h>
 #include <deal.II/lac/trilinos_tpetra_sparse_matrix.h>
 #include <deal.II/lac/trilinos_tpetra_vector.h>
+#include <deal.II/lac/vector_operation.h>
 
 // C++
 #include <fstream>
@@ -2279,9 +2280,9 @@ FSI_PU_DWR_Problem<dim>::solve_primal()
 
   // Solve
   A_direct_primal.solve(newton_update_primal, system_rhs_primal);
-  constraints_primal.distribute(newton_update_primal);
 
   newton_update_primal.compress(VectorOperation::add);
+  constraints_primal.distribute(newton_update_primal);
 }
 
 // This is the Newton iteration with simple linesearch backtracking
@@ -2349,13 +2350,8 @@ FSI_PU_DWR_Problem<dim>::newton_iteration_primal()
       linearization_point = solution_primal;
       old_solution_norm   = linearization_point.linfty_norm();
 
-      pcout << "Old solution norm: " << old_solution_norm << std::endl;
-
-
       assemble_rhs_primal();
       newton_residual = system_rhs_primal.linfty_norm();
-
-      pcout << "Newton residual: " << newton_residual << std::endl;
 
       if (newton_residual < lower_bound_newton_residual ||
           (newton_residual / initial_residual <
@@ -2367,7 +2363,7 @@ FSI_PU_DWR_Problem<dim>::newton_iteration_primal()
           break;
         }
 
-      //if (newton_residual / old_newton_residual > nonlinear_rho)
+      // if (newton_residual / old_newton_residual > nonlinear_rho)
       if (true)
         {
           assemble_matrix_primal();
@@ -2635,7 +2631,13 @@ FSI_PU_DWR_Problem<dim>::assemble_matrix_adjoint()
   for (const auto &cell : dof_handler_adjoint.active_cell_iterators())
     {
       if (!cell->is_locally_owned())
-        continue;
+        {
+          // update primal cell
+          ++cell_primal;
+
+          // skip all non locally owned cells
+          continue;
+        }
 
       fe_values.reinit(cell);
       fe_values_primal.reinit(cell_primal);
@@ -3503,22 +3505,36 @@ FSI_PU_DWR_Problem<dim>::solve_adjoint()
   // Linear solution
   TimerOutput::Scope t(timer, "Solve linear adjoint system.");
 
-  SolverControl solver_control(dof_handler_adjoint.n_dofs(), 1e-12);
+  // create the solver_control object
+  SolverControl solver_control(dof_handler_primal.n_dofs(), 1e-12);
+
+  // create the solver:
   LinearAlgebra::TpetraWrappers::SolverDirect<double>::AdditionalData
-                                                      additional_data("MUMPS");
-  LinearAlgebra::TpetraWrappers::SolverDirect<double> A_direct(solver_control,
-                                                               additional_data);
-  A_direct.initialize(system_matrix_adjoint);
+    additional_data("UMFPACK");
+  LinearAlgebra::TpetraWrappers::SolverDirect<double> A_direct_adjoint(
+    solver_control, additional_data);
 
-  A_direct.solve(solution_adjoint, system_rhs_adjoint);
+  // Create a ditributed vector to store the solution:
+  LinearAlgebra::TpetraWrappers::Vector<double>
+    completely_distributed_solution_adjoint(locally_owned_dofs_adjoint,
+                                            mpi_communicator);
 
-  constraints_adjoint.distribute(solution_adjoint);
+  A_direct_adjoint.initialize(system_matrix_adjoint);
+
+  // Solve
+  A_direct_adjoint.solve(completely_distributed_solution_adjoint,
+                         system_rhs_adjoint);
+
+  // Reset the timer
   timer_solve_adjoint.stop();
-
   pcout << "Wall time solving adjoint system: "
         << timer_solve_adjoint.cpu_time() << std::endl;
-
   timer_solve_adjoint.reset();
+
+  // distribute the solution vector
+  completely_distributed_solution_adjoint.compress(VectorOperation::add);
+  constraints_adjoint.distribute(completely_distributed_solution_adjoint);
+  solution_adjoint = completely_distributed_solution_adjoint;
 }
 
 
@@ -3562,6 +3578,18 @@ FSI_PU_DWR_Problem<dim>::output_results(
       cell_adjoint = dof_handler_adjoint.begin_active();
     for (const auto &joint_cell : joint_dof_handler.active_cell_iterators())
       {
+        if (!joint_cell->is_locally_owned())
+          {
+            // update primal cell iterator
+            ++cell_primal;
+
+            // update adjoint cell iterator
+            ++cell_adjoint;
+
+            // skip all cells that are not locally owned
+            continue;
+          }
+
         joint_cell->get_dof_indices(local_joint_dof_indices);
         cell_primal->get_dof_indices(local_dof_indices_primal);
         cell_adjoint->get_dof_indices(local_dof_indices_adjoint);
@@ -3652,10 +3680,21 @@ double
 FSI_PU_DWR_Problem<dim>::compute_point_value(Point<dim>         p,
                                              const unsigned int component) const
 {
-  Vector<double> tmp_vector(dim + dim + 1);
-  VectorTools::point_value(dof_handler_primal, solution_primal, p, tmp_vector);
+  double value = -1e100;
 
-  return tmp_vector(component);
+  try
+    {
+      Vector<double> tmp_vector(dof_handler_primal.get_fe().n_components());
+      VectorTools::point_value(dof_handler_primal,
+                               solution_primal,
+                               p,
+                               tmp_vector);
+      value = tmp_vector(component);
+    }
+  catch (typename VectorTools::ExcPointNotAvailableHere &e)
+    {}
+
+  return Utilities::MPI::max(value, mpi_communicator);
 }
 
 // Now, we arrive at the function that is responsible
@@ -3686,9 +3725,13 @@ FSI_PU_DWR_Problem<dim>::compute_drag_lift_fsi_fluid_tensor()
     n_face_q_points, std::vector<Tensor<1, dim>>(dim + dim + 1));
 
   Tensor<1, dim> drag_lift_value;
+  Tensor<1, dim> global_drag_lift_value;
 
   for (const auto &cell : dof_handler_primal.active_cell_iterators())
     {
+      if (!cell->is_locally_owned())
+        continue;
+
       // First, we are going to compute the forces that
       // act on the cylinder. We notice that only the fluid
       // equations are defined here.
@@ -3820,15 +3863,19 @@ FSI_PU_DWR_Problem<dim>::compute_drag_lift_fsi_fluid_tensor()
         }
     }
 
+  // Comuicate the drag lift value between the ranks:
+  global_drag_lift_value +=
+    Utilities::MPI::sum(drag_lift_value, mpi_communicator);
+
   // 2D-1: 500; 2D-2 and 2D-3: 20 (see Schaefer/Turek 1996)
   // No multiplication necessary for FSI benchmarks
   if (test_case == "2D-1")
-    drag_lift_value *= 500.0;
+    global_drag_lift_value *= 500.0;
 
   pcout << "Face drag:   " << "   " << std::setprecision(16)
-        << drag_lift_value[0] << std::endl;
+        << global_drag_lift_value[0] << std::endl;
   pcout << "Face lift:   " << "   " << std::setprecision(16)
-        << drag_lift_value[1] << std::endl;
+        << global_drag_lift_value[1] << std::endl;
 
   if (test_case == "2D-1")
     {
@@ -3846,14 +3893,18 @@ FSI_PU_DWR_Problem<dim>::compute_drag_lift_fsi_fluid_tensor()
   if (adjoint_rhs == "drag")
     {
       exact_error_local = 0.0;
-      exact_error_local = std::abs(drag_lift_value[0] - reference_value_drag);
+      exact_error_local =
+        std::abs(global_drag_lift_value[0] - reference_value_drag);
     }
   else if (adjoint_rhs == "lift")
     {
       exact_error_local = 0.0;
-      exact_error_local = std::abs(drag_lift_value[1] - reference_value_lift);
+      exact_error_local =
+        std::abs(global_drag_lift_value[1] - reference_value_lift);
     }
 }
+
+
 
 template <int dim>
 void
@@ -3861,9 +3912,15 @@ FSI_PU_DWR_Problem<dim>::compute_drag_lift_fsi_fluid_tensor_domain()
 {
   unsigned int drag_lift_select   = 0;
   double       drag_lift_constant = 1.0;
+  double       value              = 0.0;
 
-  double value      = 0.0;
+  // reset the right hand side
+  system_rhs_adjoint.reinit(locally_owned_dofs_adjoint,
+                            locally_relevant_dofs_adjoint,
+                            mpi_communicator,
+                            true);
   system_rhs_primal = 0;
+
   const QGauss<dim> quadrature_formula(3);
   FEValues<dim>     fe_values(fe_primal,
                           quadrature_formula,
@@ -3891,6 +3948,9 @@ FSI_PU_DWR_Problem<dim>::compute_drag_lift_fsi_fluid_tensor_domain()
 
   for (const auto &cell : dof_handler_primal.active_cell_iterators())
     {
+      if (!cell->is_locally_owned())
+        continue;
+
       local_rhs = 0;
 
       fe_values.reinit(cell);
@@ -3992,8 +4052,10 @@ FSI_PU_DWR_Problem<dim>::compute_drag_lift_fsi_fluid_tensor_domain()
 
     } // end cell
 
+  system_rhs_primal.compress(VectorOperation::add);
 
 
+  // Apply boundary conditions:
   std::vector<bool> component_mask(dim + dim + 1, true);
   component_mask[dim]       = false;
   component_mask[dim + 1]   = true;
@@ -4040,16 +4102,13 @@ FSI_PU_DWR_Problem<dim>::compute_drag_lift_fsi_fluid_tensor_domain()
 
   value = 0.;
 
-  for (std::map<types::global_dof_index, double>::const_iterator p =
-         boundary_values.begin();
-       p != boundary_values.end();
-       p++)
-    {
-      value += p->second * system_rhs_primal(p->first);
-    }
+  for (auto &boundary_value : boundary_values)
+    if (system_rhs_primal.trilinos_rcp()->getMap()->isNodeGlobalElement(
+          boundary_value.first))
+      value += boundary_value.second * system_rhs_primal(boundary_value.first);
 
-
-  global_drag_lift_value += value;
+  // Comuicate the drag lift value between the ranks:
+  global_drag_lift_value += Utilities::MPI::sum(value, mpi_communicator);
 }
 
 
@@ -4065,7 +4124,12 @@ FSI_PU_DWR_Problem<dim>::compute_drag_lift_fsi_fluid_tensor_domain_structure()
 
   // TODO: check whether system_rhs is good function here and not overwritten
   // in some stupid sense
+  system_rhs_primal.reinit(locally_owned_dofs_primal,
+                           locally_relevant_dofs_primal,
+                           mpi_communicator,
+                           true);
   system_rhs_primal = 0;
+
   const QGauss<dim> quadrature_formula(3);
   FEValues<dim>     fe_values(fe_primal,
                           quadrature_formula,
@@ -4093,6 +4157,9 @@ FSI_PU_DWR_Problem<dim>::compute_drag_lift_fsi_fluid_tensor_domain_structure()
 
   for (const auto &cell : dof_handler_primal.active_cell_iterators())
     {
+      if (!cell->is_locally_owned())
+        continue;
+
       local_rhs = 0;
 
       fe_values.reinit(cell);
@@ -4219,16 +4286,13 @@ FSI_PU_DWR_Problem<dim>::compute_drag_lift_fsi_fluid_tensor_domain_structure()
 
   value = 0.;
 
-  for (std::map<types::global_dof_index, double>::const_iterator p =
-         boundary_values.begin();
-       p != boundary_values.end();
-       p++)
-    {
-      value += p->second * system_rhs_primal(p->first);
-    }
+  for (auto &boundary_value : boundary_values)
+    if (system_rhs_primal.trilinos_rcp()->getMap()->isNodeGlobalElement(
+          boundary_value.first))
+      value += boundary_value.second * system_rhs_primal(boundary_value.first);
 
-
-  global_drag_lift_value += value;
+  // Comuicate the drag lift value between the ranks:
+  global_drag_lift_value += Utilities::MPI::sum(value, mpi_communicator);
 }
 
 
@@ -4253,6 +4317,9 @@ FSI_PU_DWR_Problem<dim>::compute_minimal_J()
 
   for (const auto &cell : dof_handler_primal.active_cell_iterators())
     {
+      if (!cell->is_locally_owned())
+        continue;
+
       fe_values.reinit(cell);
 
       fe_values.get_function_gradients(solution_primal, old_solution_grads);
@@ -4271,7 +4338,8 @@ FSI_PU_DWR_Problem<dim>::compute_minimal_J()
         }
     }
 
-  pcout << "Min J: " << "   " << min_J << std::endl;
+  double global_minimal_J = Utilities::MPI::min(min_J, mpi_communicator);
+  pcout << "Min J: " << "   " << global_minimal_J << std::endl;
 }
 
 
@@ -4284,14 +4352,14 @@ void
 FSI_PU_DWR_Problem<dim>::compute_functional_values()
 {
   double x1, y1, p_front, p_back, p_diff;
-  x1 =
-    compute_point_value(Point<dim>(0.6, 0.2), dim); // dis-x of flag tip (FSI 1)
-  y1 = compute_point_value(Point<dim>(0.6, 0.2),
-                           dim + 1); // dis-y of flag tip (FSI 1)
-
-  p_front = compute_point_value(Point<dim>(0.15, 0.2), dim + dim); // pressure
-  p_back =
-    0.0; // compute_point_value(Point<dim>(0.25,0.2), dim+dim); // pressure
+  // dis-x of flag tip (FSI 1)
+  x1 = compute_point_value(Point<dim>(0.6, 0.2), dim);
+  // dis-y of flag tip (FSI 1)
+  y1 = compute_point_value(Point<dim>(0.6, 0.2), dim + 1);
+  // pressure
+  p_front = compute_point_value(Point<dim>(0.15, 0.2), dim + dim);
+  // compute_point_value(Point<dim>(0.25,0.2), dim+dim); // pressure
+  p_back = 0.0;
 
   p_diff = p_front - p_back;
 
@@ -4348,6 +4416,9 @@ FSI_PU_DWR_Problem<dim>::refine_mesh()
 {
   for (const auto &cell : dof_handler_primal.active_cell_iterators())
     {
+      if (!cell->is_locally_owned())
+        continue;
+
       // Refine the solid
       if (cell->material_id() == 1)
         cell->set_refine_flag();
@@ -4504,6 +4575,14 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
 
   for (const auto &cell : dof_handler_pou.active_cell_iterators())
     {
+      if (!cell->is_locally_owned())
+        {
+          // update adjoint cell iterator
+          ++cell_adjoint;
+
+          // skip all non locally owned cells
+          continue;
+        }
       fe_values_pou.reinit(cell);
       fe_values_adjoint.reinit(cell_adjoint);
 
@@ -4738,6 +4817,7 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
   dual_hanging_node_constraints_pou.condense(error_indicators);
 
   // Averaging (making the 'solution' continuous)
+  error_indicators.compress(VectorOperation::add);
   dual_hanging_node_constraints_pou.distribute(error_indicators);
 
   // end Block 2
@@ -4859,6 +4939,9 @@ FSI_PU_DWR_Problem<dim>::refine_average_with_PU_DWR(
 
   for (const auto &cell : dof_handler_pou.active_cell_iterators())
     {
+      if (!cell->is_locally_owned())
+        continue;
+
       error_ind = 0.0;
       cell->get_dof_indices(local_dof_indices);
 
@@ -5004,8 +5087,7 @@ FSI_PU_DWR_Problem<dim>::run()
 
               setup_system_adjoint();
 
-              solution_transfer.interpolate(tmp_solution_primal,
-                                            solution_primal);
+              solution_transfer.interpolate(solution_primal);
             }
 
 
