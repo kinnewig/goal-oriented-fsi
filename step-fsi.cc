@@ -103,6 +103,7 @@
 #include <deal.II/fe/fe_q.h>
 #include <deal.II/fe/fe_system.h>
 #include <deal.II/fe/fe_tools.h>
+#include <deal.II/fe/fe_tools_interpolate.templates.h>
 #include <deal.II/fe/fe_values.h>
 #include <deal.II/fe/mapping_q1.h>
 
@@ -4480,11 +4481,18 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
                                           primal_hanging_node_constraints);
   primal_hanging_node_constraints.close();
 
-  LinearAlgebra::TpetraWrappers::Vector<double>
-    solution_primal_of_adjoint_length;
-  solution_primal_of_adjoint_length.reinit(locally_owned_dofs_adjoint,
-                                           locally_relevant_dofs_adjoint,
-                                           mpi_communicator);
+
+  // interpolate requires completely distributed vecors:
+  //LinearAlgebra::TpetraWrappers::Vector<double> completely_distributed_solution_primal(
+  //  locally_owned_dofs_primal, mpi_communicator);
+  //completely_distributed_solution_primal = solution_primal;
+
+  locally_owned_dofs_adjoint = dof_handler_adjoint.locally_owned_dofs();
+  locally_relevant_dofs_adjoint =
+    DoFTools::extract_locally_relevant_dofs(dof_handler_adjoint);
+
+  LinearAlgebra::TpetraWrappers::Vector<double> solution_primal_of_adjoint_length(
+    locally_owned_dofs_adjoint, locally_relevant_dofs_adjoint, mpi_communicator);
 
   // Main function 1: Interpolate cell-wise the
   // primal solution into the dual FE space.
@@ -4495,7 +4503,6 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
                        dof_handler_adjoint,
                        dual_hanging_node_constraints,
                        solution_primal_of_adjoint_length);
-
 
 
   // Local vectors of dual weights obtained
