@@ -951,9 +951,9 @@ private:
   LinearAlgebra::TpetraWrappers::Vector<double> system_rhs_adjoint;
 
   // PU for PU-DWR localization
-  FESystem<dim>   fe_pou;
-  DoFHandler<dim> dof_handler_pou;
-  Vector<float>   error_indicators;
+  FESystem<dim>                                 fe_pou;
+  DoFHandler<dim>                               dof_handler_pou;
+  LinearAlgebra::TpetraWrappers::Vector<double> error_indicators;
 
   // Prallel output
   ConditionalOStream pcout;
@@ -4453,53 +4453,65 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
   // This is in contrast to usual procedures, where the error
   // in general is stored cell-wise.
   dof_handler_pou.distribute_dofs(fe_pou);
-  error_indicators.reinit(dof_handler_pou.n_dofs());
 
+  // Get the working index sets:
+  // locally_owned_dofs stores a one-to-one map of all dofs, and holds
+  //                    the dofs that belong to this rank.
+  // locally_relevant_dofs contains the locally_owned_dofs and also some
+  //                    dofs that do belong to other ranks but are relevant
+  //                    for the rank.
+  IndexSet locally_owned_dofs_pou = dof_handler_pou.locally_owned_dofs();
+  IndexSet locally_relevant_dofs_pou =
+    DoFTools::extract_locally_relevant_dofs(dof_handler_pou);
 
-  // Block 1 (building the dual weights):
-  // In the following the very specific
-  // part (z-I_hz) of DWR is implemented.
-  // This part is the same for classical error estimation
-  // and PU error estimation.
-  std::vector<unsigned int> block_component(5, 0);
-  block_component[dim]       = 1;
-  block_component[dim + 1]   = 1;
-  block_component[dim + dim] = 2;
-
-
-  DoFRenumbering::component_wise(dof_handler_adjoint, block_component);
+  error_indicators.reinit(locally_owned_dofs_pou,
+                          locally_relevant_dofs_pou,
+                          mpi_communicator,
+                          true);
 
   // Implement the interpolation operator
   // (z-z_h)=(z-I_hz)
   AffineConstraints<double> dual_hanging_node_constraints;
-  DoFTools::make_hanging_node_constraints(dof_handler_adjoint,
-                                          dual_hanging_node_constraints);
-  dual_hanging_node_constraints.close();
+  {
+    dual_hanging_node_constraints.clear();
+    dual_hanging_node_constraints.reinit(locally_owned_dofs_adjoint,
+                                         locally_relevant_dofs_adjoint);
+    DoFTools::make_hanging_node_constraints(dof_handler_adjoint,
+                                            dual_hanging_node_constraints);
+    dual_hanging_node_constraints.close();
+  }
 
   AffineConstraints<double> primal_hanging_node_constraints;
-  DoFTools::make_hanging_node_constraints(dof_handler_primal,
-                                          primal_hanging_node_constraints);
-  primal_hanging_node_constraints.close();
-
+  {
+    primal_hanging_node_constraints.clear();
+    primal_hanging_node_constraints.reinit(locally_owned_dofs_primal,
+                                           locally_relevant_dofs_primal);
+    DoFTools::make_hanging_node_constraints(dof_handler_primal,
+                                            primal_hanging_node_constraints);
+    primal_hanging_node_constraints.close();
+  }
 
   // interpolate requires completely distributed vecors:
-  //LinearAlgebra::TpetraWrappers::Vector<double> completely_distributed_solution_primal(
-  //  locally_owned_dofs_primal, mpi_communicator);
-  //completely_distributed_solution_primal = solution_primal;
+  LinearAlgebra::TpetraWrappers::Vector<double>
+  completely_distributed_solution_primal(
+    //locally_owned_dofs_primal, mpi_communicator);
+    dof_handler_primal.locally_owned_dofs(), mpi_communicator);
+  completely_distributed_solution_primal = solution_primal;
 
-  locally_owned_dofs_adjoint = dof_handler_adjoint.locally_owned_dofs();
-  locally_relevant_dofs_adjoint =
-    DoFTools::extract_locally_relevant_dofs(dof_handler_adjoint);
-
-  LinearAlgebra::TpetraWrappers::Vector<double> solution_primal_of_adjoint_length(
-    locally_owned_dofs_adjoint, locally_relevant_dofs_adjoint, mpi_communicator);
+  //locally_relevant_dofs_adjoint = DoFTools::extract_locally_relevant_dofs(dof_handler_adjoint);
+  LinearAlgebra::TpetraWrappers::Vector<double>
+    solution_primal_of_adjoint_length(locally_owned_dofs_adjoint,
+                                      locally_relevant_dofs_adjoint,
+                                      mpi_communicator,
+                                      true);
 
   // Main function 1: Interpolate cell-wise the
   // primal solution into the dual FE space.
   // This rescaled primal solution is called
   //   ** solution_primal_of_adjoint_length **
   FETools::interpolate(dof_handler_primal,
-                       solution_primal,
+                       //solution_primal,
+                       completely_distributed_solution_primal,
                        dof_handler_adjoint,
                        dual_hanging_node_constraints,
                        solution_primal_of_adjoint_length);
@@ -4927,10 +4939,11 @@ FSI_PU_DWR_Problem<dim>::refine_average_with_PU_DWR(
   // Here: averaged refinement
   // Alternatives are in deal.II:
   // refine_and_coarsen_fixed_fraction for example
-  for (Vector<float>::iterator i = error_indicators.begin();
-       i != error_indicators.end();
-       ++i)
-    *i = std::fabs(*i);
+  // TODO: Write a Tpetra Loop
+  //for (auto &i = error_indicators.begin();
+  //     i != error_indicators.end();
+  //     ++i)
+  //  *i = std::fabs(*i);
 
 
   const unsigned int                   dofs_per_cell_pou = fe_pou.dofs_per_cell;
