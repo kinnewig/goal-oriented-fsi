@@ -2189,6 +2189,8 @@ FSI_PU_DWR_Problem<dim>::set_initial_bc_primal()
                                            mpi_communicator,
                                            true);
 
+  completely_distributed_solution_primal = solution_primal;
+
   for (auto &boundary_value : boundary_values)
     completely_distributed_solution_primal(boundary_value.first) =
       boundary_value.second;
@@ -2364,8 +2366,9 @@ FSI_PU_DWR_Problem<dim>::newton_iteration_primal()
           break;
         }
 
-      // if (newton_residual / old_newton_residual > nonlinear_rho)
-      if (true)
+      // hey, it works!
+      if (newton_residual / old_newton_residual > nonlinear_rho)
+        // if (true)
         {
           assemble_matrix_primal();
           // Only factorize when matrix is re-built
@@ -4493,28 +4496,35 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
 
   // interpolate requires completely distributed vecors:
   LinearAlgebra::TpetraWrappers::Vector<double>
-  completely_distributed_solution_primal(
-    //locally_owned_dofs_primal, mpi_communicator);
-    dof_handler_primal.locally_owned_dofs(), mpi_communicator);
+    completely_distributed_solution_primal(
+      dof_handler_primal.locally_owned_dofs(),
+      mpi_communicator);
   completely_distributed_solution_primal = solution_primal;
 
-  //locally_relevant_dofs_adjoint = DoFTools::extract_locally_relevant_dofs(dof_handler_adjoint);
+  locally_relevant_dofs_adjoint =
+    DoFTools::extract_locally_relevant_dofs(dof_handler_adjoint);
   LinearAlgebra::TpetraWrappers::Vector<double>
-    solution_primal_of_adjoint_length(locally_owned_dofs_adjoint,
+    solution_primal_of_adjoint_length(dof_handler_adjoint.locally_owned_dofs(),
                                       locally_relevant_dofs_adjoint,
                                       mpi_communicator,
-                                      true);
+                                      false);
 
   // Main function 1: Interpolate cell-wise the
   // primal solution into the dual FE space.
   // This rescaled primal solution is called
   //   ** solution_primal_of_adjoint_length **
   FETools::interpolate(dof_handler_primal,
-                       //solution_primal,
+                       // solution_primal,
                        completely_distributed_solution_primal,
                        dof_handler_adjoint,
                        dual_hanging_node_constraints,
                        solution_primal_of_adjoint_length);
+
+  // works in sequential, somewhat works in parallel (small error, there seems
+  // to be a communication issue)
+  solution_primal_of_adjoint_length.compress(VectorOperation::add);
+  pcout << "solution_primal_of_adjoint_length.l2_norm() = "
+        << solution_primal_of_adjoint_length.l2_norm() << std::endl;
 
 
   // Local vectors of dual weights obtained
@@ -4532,6 +4542,9 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
                                     dof_handler_primal,
                                     primal_hanging_node_constraints,
                                     dual_weights);
+
+  // works in sequential, return crap in parallel
+  pcout << "dual_weights.l2_norm() = " << dual_weights.l2_norm() << std::endl;
 
   // end Block 1
 
@@ -4839,6 +4852,8 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
   error_indicators.compress(VectorOperation::add);
   dual_hanging_node_constraints_pou.distribute(error_indicators);
 
+  pcout << "error_indicators.l2_norm() = " << error_indicators.l2_norm()
+        << std::endl;
   // end Block 2
 
 
@@ -4935,15 +4950,34 @@ FSI_PU_DWR_Problem<dim>::refine_average_with_PU_DWR(
   double estimated_DWR_error =
     compute_error_indicators_a_la_PU_DWR(refinement_cycle);
 
+  error_indicators.compress(VectorOperation::add);
+
   // Step 2: Choosing refinement strategy
   // Here: averaged refinement
   // Alternatives are in deal.II:
   // refine_and_coarsen_fixed_fraction for example
-  // TODO: Write a Tpetra Loop
-  //for (auto &i = error_indicators.begin();
-  //     i != error_indicators.end();
-  //     ++i)
-  //  *i = std::fabs(*i);
+
+  // We perform this loop directly using the kokkos representation to speed up
+  // the loop:
+  {
+    // Create a read/write Kokkos view
+    auto vector_2d =
+      error_indicators.trilinos_vector()
+        .template getLocalView<Kokkos::HostSpace>(Tpetra::Access::ReadWrite);
+
+    // Create the 1d Kokkos View
+    auto vector_1d = Kokkos::subview(vector_2d, Kokkos::ALL(), 0);
+
+    // Get the length
+    const size_t localLength =
+      error_indicators.trilinos_vector().getLocalLength();
+
+    // The acutal loop
+    for (size_t k = 0; k < localLength; ++k)
+      {
+        vector_1d(k) = std::abs(vector_1d(k));
+      }
+  }
 
 
   const unsigned int                   dofs_per_cell_pou = fe_pou.dofs_per_cell;
@@ -5049,7 +5083,11 @@ FSI_PU_DWR_Problem<dim>::run()
           // Use solution transfer to interpolate solution
           // to the next mesh in order to have a better
           // initial guess for the next refinement level.
-          LinearAlgebra::TpetraWrappers::Vector<double> tmp_solution_primal;
+          LinearAlgebra::TpetraWrappers::Vector<double> tmp_solution_primal(
+            locally_owned_dofs_primal,
+            locally_relevant_dofs_primal,
+            mpi_communicator,
+            true);
           tmp_solution_primal = solution_primal;
 
           SolutionTransfer<dim, LinearAlgebra::TpetraWrappers::Vector<double>>
