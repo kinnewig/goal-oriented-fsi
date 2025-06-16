@@ -4495,10 +4495,14 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
   }
 
   // interpolate requires completely distributed vecors:
+  locally_relevant_dofs_primal =
+    DoFTools::extract_locally_relevant_dofs(dof_handler_primal);
   LinearAlgebra::TpetraWrappers::Vector<double>
     completely_distributed_solution_primal(
       dof_handler_primal.locally_owned_dofs(),
-      mpi_communicator);
+      locally_relevant_dofs_primal,
+      mpi_communicator,
+      false);
   completely_distributed_solution_primal = solution_primal;
 
   locally_relevant_dofs_adjoint =
@@ -4507,14 +4511,13 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
     solution_primal_of_adjoint_length(dof_handler_adjoint.locally_owned_dofs(),
                                       locally_relevant_dofs_adjoint,
                                       mpi_communicator,
-                                      false);
+                                      true);
 
   // Main function 1: Interpolate cell-wise the
   // primal solution into the dual FE space.
   // This rescaled primal solution is called
   //   ** solution_primal_of_adjoint_length **
   FETools::interpolate(dof_handler_primal,
-                       // solution_primal,
                        completely_distributed_solution_primal,
                        dof_handler_adjoint,
                        dual_hanging_node_constraints,
@@ -4527,23 +4530,33 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
         << solution_primal_of_adjoint_length.l2_norm() << std::endl;
 
 
+  LinearAlgebra::TpetraWrappers::Vector<double> solution_adjoint_distributed;
+  solution_adjoint_distributed.reinit(locally_owned_dofs_adjoint,
+                                      locally_relevant_dofs_adjoint,
+                                      mpi_communicator,
+                                      false);
+  solution_adjoint_distributed = solution_adjoint;
+
+
   // Local vectors of dual weights obtained
   // from the adjoint solution
   LinearAlgebra::TpetraWrappers::Vector<double> dual_weights;
   dual_weights.reinit(locally_owned_dofs_adjoint,
                       locally_relevant_dofs_adjoint,
-                      mpi_communicator);
+                      mpi_communicator,
+                      true);
 
   // Main function 2: Execute (z-I_hz) (in the dual space),
   // yielding the adjoint weights for error estimation.
   FETools::interpolation_difference(dof_handler_adjoint,
                                     dual_hanging_node_constraints,
-                                    solution_adjoint,
+                                    solution_adjoint_distributed,
                                     dof_handler_primal,
                                     primal_hanging_node_constraints,
                                     dual_weights);
 
   // works in sequential, return crap in parallel
+  dual_weights.compress(VectorOperation::add);
   pcout << "dual_weights.l2_norm() = " << dual_weights.l2_norm() << std::endl;
 
   // end Block 1
@@ -4605,9 +4618,31 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
   typename DoFHandler<dim>::active_cell_iterator cell_adjoint =
     dof_handler_adjoint.begin_active();
 
+  solution_primal_of_adjoint_length.compress(VectorOperation::add);
+  dual_weights.compress(VectorOperation::add);
+
+  LinearAlgebra::TpetraWrappers::Vector<double>
+    solution_primal_of_adjoint_length_bla(locally_owned_dofs_adjoint,
+                                          locally_relevant_dofs_adjoint,
+                                          mpi_communicator);
+  solution_primal_of_adjoint_length_bla = solution_primal_of_adjoint_length;
+
+  LinearAlgebra::TpetraWrappers::Vector<double> dual_weights_bla(
+    locally_owned_dofs_adjoint,
+    locally_relevant_dofs_adjoint,
+    mpi_communicator);
+  dual_weights_bla = dual_weights;
+
+  // pcout << "dual_weights_bla.l2_norm() = " << dual_weights_bla.l2_norm() <<
+  // std::endl;
+
   for (const auto &cell : dof_handler_pou.active_cell_iterators())
     {
-      if (!cell->is_locally_owned())
+      if ((cell->is_locally_owned() && !cell_adjoint->is_locally_owned()) ||
+          (!cell->is_locally_owned() && cell_adjoint->is_locally_owned()))
+        std::cout << "This should not be happening!" << std::endl;
+
+      if (!cell->is_locally_owned() || !cell_adjoint->is_locally_owned())
         {
           // update adjoint cell iterator
           ++cell_adjoint;
@@ -4624,16 +4659,17 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
       // primal solution (cell residuals)
       // But we use the adjoint FE since we previously enlarged the
       // primal solution to the length of the adjoint vector.
-      fe_values_adjoint.get_function_values(solution_primal_of_adjoint_length,
-                                            primal_cell_values);
+      fe_values_adjoint.get_function_values(
+        solution_primal_of_adjoint_length_bla, primal_cell_values);
 
       fe_values_adjoint.get_function_gradients(
-        solution_primal_of_adjoint_length, primal_cell_gradients);
+        solution_primal_of_adjoint_length_bla, primal_cell_gradients);
 
       // adjoint weights
-      fe_values_adjoint.get_function_values(dual_weights, dual_weights_values);
+      fe_values_adjoint.get_function_values(dual_weights_bla,
+                                            dual_weights_values);
 
-      fe_values_adjoint.get_function_gradients(dual_weights,
+      fe_values_adjoint.get_function_gradients(dual_weights_bla,
                                                dual_weights_gradients);
 
 
@@ -4856,6 +4892,14 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
         << std::endl;
   // end Block 2
 
+  {
+    LinearAlgebra::TpetraWrappers::Vector<double> error_indicators_bla(
+      locally_owned_dofs_adjoint, mpi_communicator);
+    error_indicators_bla = error_indicators;
+
+    error_indicators.reinit(locally_owned_dofs_adjoint, mpi_communicator);
+    error_indicators = error_indicators_bla;
+  }
 
   // Block 3 (data and terminal print out)
   DataOut<dim> data_out;
@@ -4878,54 +4922,54 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
         << std::endl;
   pcout << "   Exact error:            " << exact_error_local << std::endl;
   double total_estimated_error = 0.0;
-  for (unsigned int k = 0; k < error_indicators.size(); k++)
-    total_estimated_error += error_indicators(k);
+  //for (unsigned int k = 0; k < error_indicators.size(); k++)
+  //  total_estimated_error += error_indicators(k);
 
-  // Take the absolute of the estimated error.
-  // However, we might check if the signs
-  // of the exact error and the estimated error are the same.
-  total_estimated_error = std::abs(total_estimated_error);
+  //// Take the absolute of the estimated error.
+  //// However, we might check if the signs
+  //// of the exact error and the estimated error are the same.
+  //total_estimated_error = std::abs(total_estimated_error);
 
-  pcout << "   Estimated error (prim): " << total_estimated_error << std::endl;
+  //pcout << "   Estimated error (prim): " << total_estimated_error << std::endl;
 
-  // From the JCAM paper: compute indicator indices to check
-  // effectivity of error estimator.
-  double total_estimated_error_absolute_values = 0.0;
-  for (unsigned int k = 0; k < error_indicators.size(); k++)
-    total_estimated_error_absolute_values += std::abs(error_indicators(k));
+  //// From the JCAM paper: compute indicator indices to check
+  //// effectivity of error estimator.
+  //double total_estimated_error_absolute_values = 0.0;
+  //for (unsigned int k = 0; k < error_indicators.size(); k++)
+  //  total_estimated_error_absolute_values += std::abs(error_indicators(k));
 
-  // "ind" things were mainly for paper with Thomas Richter (Richter/Wick; JCAM,
-  // 2015)
-  //  std::cout << "   Estimated error (ind):  " <<
-  //  total_estimated_error_absolute_values << std::endl;
+  //// "ind" things were mainly for paper with Thomas Richter (Richter/Wick; JCAM,
+  //// 2015)
+  ////  std::cout << "   Estimated error (ind):  " <<
+  ////  total_estimated_error_absolute_values << std::endl;
 
-  pcout << "   Ieff:                   "
-        << total_estimated_error / exact_error_local << std::endl;
-  // std::cout << "   Iind:                   " <<
-  // total_estimated_error_absolute_values/exact_error_local << std::endl;
+  //pcout << "   Ieff:                   "
+  //      << total_estimated_error / exact_error_local << std::endl;
+  //// std::cout << "   Iind:                   " <<
+  //// total_estimated_error_absolute_values/exact_error_local << std::endl;
 
 
 
-  // Write everything into a file
-  // file.precision(3);
-  file << std::setiosflags(std::ios::scientific) << std::setprecision(2);
-  file << dof_handler_primal.n_dofs() << "\t";
-  file << exact_error_local << "\t";
-  file << total_estimated_error << "\t";
-  file << total_estimated_error_absolute_values << "\t";
-  file << total_estimated_error / exact_error_local << "\t";
-  file << total_estimated_error_absolute_values / exact_error_local << "\n";
-  file.flush();
+  //// Write everything into a file
+  //// file.precision(3);
+  //file << std::setiosflags(std::ios::scientific) << std::setprecision(2);
+  //file << dof_handler_primal.n_dofs() << "\t";
+  //file << exact_error_local << "\t";
+  //file << total_estimated_error << "\t";
+  //file << total_estimated_error_absolute_values << "\t";
+  //file << total_estimated_error / exact_error_local << "\t";
+  //file << total_estimated_error_absolute_values / exact_error_local << "\n";
+  //file.flush();
 
-  // Write everything into a file gnuplot
-  file_gnuplot << std::setiosflags(std::ios::scientific)
-               << std::setprecision(2);
-  // file_gnuplot.precision(3);
-  file_gnuplot << dof_handler_primal.n_dofs() << "\t";
-  file_gnuplot << exact_error_local << "\t";
-  file_gnuplot << total_estimated_error << "\t";
-  file_gnuplot << total_estimated_error_absolute_values << "\n";
-  file_gnuplot.flush();
+  //// Write everything into a file gnuplot
+  //file_gnuplot << std::setiosflags(std::ios::scientific)
+  //             << std::setprecision(2);
+  //// file_gnuplot.precision(3);
+  //file_gnuplot << dof_handler_primal.n_dofs() << "\t";
+  //file_gnuplot << exact_error_local << "\t";
+  //file_gnuplot << total_estimated_error << "\t";
+  //file_gnuplot << total_estimated_error_absolute_values << "\n";
+  //file_gnuplot.flush();
 
 
   // end Block 3
@@ -5001,7 +5045,7 @@ FSI_PU_DWR_Problem<dim>::refine_average_with_PU_DWR(
 
       for (unsigned int i = 0; i < dofs_per_cell_pou; ++i)
         {
-          error_ind += error_indicators(local_dof_indices[i]);
+          //error_ind += error_indicators(local_dof_indices[i]);
         }
 
       // For uniform (global) mesh refinement,
