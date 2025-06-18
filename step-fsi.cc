@@ -954,6 +954,7 @@ private:
   FESystem<dim>                                 fe_pou;
   DoFHandler<dim>                               dof_handler_pou;
   LinearAlgebra::TpetraWrappers::Vector<double> error_indicators;
+  LinearAlgebra::TpetraWrappers::Vector<double> completely_distributed_error_indicators;
 
   // Prallel output
   ConditionalOStream pcout;
@@ -991,6 +992,8 @@ private:
   double reference_value_drag, reference_value_lift, reference_value_p_front,
     reference_value_p_diff, exact_error_local, reference_value_flag_tip_ux,
     reference_value_flag_tip_uy;
+
+  double error_indicator_mean_value;
 };
 
 
@@ -2572,6 +2575,7 @@ FSI_PU_DWR_Problem<dim>::assemble_matrix_adjoint()
   const unsigned int n_q_points      = quadrature_formula.size();
   const unsigned int n_face_q_points = face_quadrature_formula.size();
 
+  Vector<double>     local_rhs(dofs_per_cell);
   FullMatrix<double> local_matrix(dofs_per_cell, dofs_per_cell);
 
   std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
@@ -2647,6 +2651,7 @@ FSI_PU_DWR_Problem<dim>::assemble_matrix_adjoint()
       fe_values_primal.reinit(cell_primal);
 
       local_matrix = 0;
+      local_rhs    = 0;
 
       // We need the cell diameter to control the fluid mesh motion
       cell_diameter = cell->diameter();
@@ -2933,13 +2938,6 @@ FSI_PU_DWR_Problem<dim>::assemble_matrix_adjoint()
             }
 
 
-
-          // This is the same as discussed in step-22:
-          cell->get_dof_indices(local_dof_indices);
-          constraints_adjoint.distribute_local_to_global(local_matrix,
-                                                         local_dof_indices,
-                                                         system_matrix_adjoint);
-
           // Finally, we arrive at the end for assembling the matrix
           // for the fluid equations and step to the computation of the
           // structure terms:
@@ -3030,16 +3028,16 @@ FSI_PU_DWR_Problem<dim>::assemble_matrix_adjoint()
               // end n_q_points
             }
 
-
-          cell->get_dof_indices(local_dof_indices);
-          constraints_adjoint.distribute_local_to_global(local_matrix,
-                                                         local_dof_indices,
-                                                         system_matrix_adjoint);
-
-
-
         } // end if (second PDE: STVK material)
-          // end cell
+      // end cell
+
+      // This is the same as discussed in step-22:
+      cell->get_dof_indices(local_dof_indices);
+      constraints_adjoint.distribute_local_to_global(local_matrix,
+                                                     local_rhs,
+                                                     local_dof_indices,
+                                                     system_matrix_adjoint,
+                                                     system_rhs_adjoint);
 
       // update primal cell
       ++cell_primal;
@@ -3084,7 +3082,8 @@ FSI_PU_DWR_Problem<dim>::assemble_rhs_adjoint_drag()
   // const unsigned int   n_q_points      = quadrature_formula.size();
   const unsigned int n_face_q_points = face_quadrature_formula.size();
 
-  Vector<double> local_rhs(dofs_per_cell);
+  Vector<double>     local_rhs(dofs_per_cell);
+  FullMatrix<double> local_matrix(dofs_per_cell, dofs_per_cell);
 
   std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
 
@@ -3101,7 +3100,8 @@ FSI_PU_DWR_Problem<dim>::assemble_rhs_adjoint_drag()
         continue;
 
       fe_values.reinit(cell);
-      local_rhs = 0;
+      local_rhs    = 0;
+      local_matrix = 0;
 
       // Again, material_id == 0 corresponds to
       // the domain for fluid equations
@@ -3304,8 +3304,10 @@ FSI_PU_DWR_Problem<dim>::assemble_rhs_adjoint_drag()
 
 
           cell->get_dof_indices(local_dof_indices);
-          constraints_adjoint.distribute_local_to_global(local_rhs,
+          constraints_adjoint.distribute_local_to_global(local_matrix,
+                                                         local_rhs,
                                                          local_dof_indices,
+                                                         system_matrix_adjoint,
                                                          system_rhs_adjoint);
 
           // Finally, we arrive at the end for assembling
@@ -3538,6 +3540,11 @@ FSI_PU_DWR_Problem<dim>::solve_adjoint()
   // distribute the solution vector
   completely_distributed_solution_adjoint.compress(VectorOperation::add);
   constraints_adjoint.distribute(completely_distributed_solution_adjoint);
+
+
+  pcout << "solution_adjoint.l2_norm() = "
+        << completely_distributed_solution_adjoint.l2_norm() << std::endl;
+
   solution_adjoint = completely_distributed_solution_adjoint;
 }
 
@@ -4894,10 +4901,12 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
 
   {
     LinearAlgebra::TpetraWrappers::Vector<double> error_indicators_bla(
-      locally_owned_dofs_adjoint, mpi_communicator);
+      locally_owned_dofs_pou, locally_relevant_dofs_pou, mpi_communicator);
     error_indicators_bla = error_indicators;
 
-    error_indicators.reinit(locally_owned_dofs_adjoint, mpi_communicator);
+    error_indicators.reinit(locally_owned_dofs_pou,
+                            locally_relevant_dofs_pou,
+                            mpi_communicator);
     error_indicators = error_indicators_bla;
   }
 
@@ -4921,57 +4930,84 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
   pcout << "   Dofs:                   " << dof_handler_primal.n_dofs()
         << std::endl;
   pcout << "   Exact error:            " << exact_error_local << std::endl;
-  double total_estimated_error = 0.0;
-  //for (unsigned int k = 0; k < error_indicators.size(); k++)
-  //  total_estimated_error += error_indicators(k);
 
-  //// Take the absolute of the estimated error.
-  //// However, we might check if the signs
-  //// of the exact error and the estimated error are the same.
-  //total_estimated_error = std::abs(total_estimated_error);
+  double total_estimated_error_local                 = 0.0;
+  double total_estimated_error_absolute_values_local = 0.0;
 
-  //pcout << "   Estimated error (prim): " << total_estimated_error << std::endl;
+  completely_distributed_error_indicators.reinit(locally_owned_dofs_pou, mpi_communicator);
+  completely_distributed_error_indicators = error_indicators;
+  {
+    // Create a read-only Kokkos view
+    auto vector_2d =
+      completely_distributed_error_indicators.trilinos_vector()
+        .template getLocalView<Kokkos::HostSpace>(Tpetra::Access::ReadOnly);
 
-  //// From the JCAM paper: compute indicator indices to check
-  //// effectivity of error estimator.
-  //double total_estimated_error_absolute_values = 0.0;
-  //for (unsigned int k = 0; k < error_indicators.size(); k++)
-  //  total_estimated_error_absolute_values += std::abs(error_indicators(k));
+    // Create the 1d Kokkos View
+    auto vector_1d = Kokkos::subview(vector_2d, Kokkos::ALL(), 0);
 
-  //// "ind" things were mainly for paper with Thomas Richter (Richter/Wick; JCAM,
-  //// 2015)
-  ////  std::cout << "   Estimated error (ind):  " <<
-  ////  total_estimated_error_absolute_values << std::endl;
+    // Get the length
+    const size_t localLength =
+      completely_distributed_error_indicators.trilinos_vector().getLocalLength();
 
-  //pcout << "   Ieff:                   "
-  //      << total_estimated_error / exact_error_local << std::endl;
-  //// std::cout << "   Iind:                   " <<
-  //// total_estimated_error_absolute_values/exact_error_local << std::endl;
+    // The acutal loop
+    for (size_t k = 0; k < localLength; ++k)
+      {
+        total_estimated_error_local += vector_1d(k);
 
+        // From the JCAM paper: compute indicator indices to check
+        // effectivity of error estimator.
+        total_estimated_error_absolute_values_local += std::abs(vector_1d(k));
+      }
+  }
 
-
-  //// Write everything into a file
-  //// file.precision(3);
-  //file << std::setiosflags(std::ios::scientific) << std::setprecision(2);
-  //file << dof_handler_primal.n_dofs() << "\t";
-  //file << exact_error_local << "\t";
-  //file << total_estimated_error << "\t";
-  //file << total_estimated_error_absolute_values << "\t";
-  //file << total_estimated_error / exact_error_local << "\t";
-  //file << total_estimated_error_absolute_values / exact_error_local << "\n";
-  //file.flush();
-
-  //// Write everything into a file gnuplot
-  //file_gnuplot << std::setiosflags(std::ios::scientific)
-  //             << std::setprecision(2);
-  //// file_gnuplot.precision(3);
-  //file_gnuplot << dof_handler_primal.n_dofs() << "\t";
-  //file_gnuplot << exact_error_local << "\t";
-  //file_gnuplot << total_estimated_error << "\t";
-  //file_gnuplot << total_estimated_error_absolute_values << "\n";
-  //file_gnuplot.flush();
+  double total_estimated_error                 = 0.0;
+  double total_estimated_error_absolute_values = 0.0;
 
 
+
+  // Comuicate between the ranks:
+  total_estimated_error =
+    Utilities::MPI::sum(total_estimated_error_local, mpi_communicator);
+
+  total_estimated_error_absolute_values =
+    Utilities::MPI::sum(total_estimated_error_absolute_values_local, mpi_communicator);
+
+  // Take the absolute of the estimated error.
+  // However, we might check if the signs
+  // of the exact error and the estimated error are the same.
+  total_estimated_error = std::abs(total_estimated_error);
+
+  pcout << "   Estimated error (prim): " << total_estimated_error << std::endl;
+  pcout << "   Estimated error (ind):  "
+        << total_estimated_error_absolute_values << std::endl;
+  pcout << "   Ieff:                   "
+        << total_estimated_error / exact_error_local << std::endl;
+  pcout << "   Iind:                   "
+        << total_estimated_error_absolute_values / exact_error_local
+        << std::endl;
+
+
+
+  // Write everything into a file
+  // file.precision(3);
+  file << std::setiosflags(std::ios::scientific) << std::setprecision(2);
+  file << dof_handler_primal.n_dofs() << "\t";
+  file << exact_error_local << "\t";
+  file << total_estimated_error << "\t";
+  file << total_estimated_error_absolute_values << "\t";
+  file << total_estimated_error / exact_error_local << "\t";
+  file << total_estimated_error_absolute_values / exact_error_local << "\n";
+  file.flush();
+
+  // Write everything into a file gnuplot
+  file_gnuplot << std::setiosflags(std::ios::scientific)
+               << std::setprecision(2);
+  // file_gnuplot.precision(3);
+  file_gnuplot << dof_handler_primal.n_dofs() << "\t";
+  file_gnuplot << exact_error_local << "\t";
+  file_gnuplot << total_estimated_error << "\t";
+  file_gnuplot << total_estimated_error_absolute_values << "\n";
+  file_gnuplot.flush();
   // end Block 3
 
 
@@ -4994,7 +5030,7 @@ FSI_PU_DWR_Problem<dim>::refine_average_with_PU_DWR(
   double estimated_DWR_error =
     compute_error_indicators_a_la_PU_DWR(refinement_cycle);
 
-  error_indicators.compress(VectorOperation::add);
+  // error_indicators.compress(VectorOperation::add);
 
   // Step 2: Choosing refinement strategy
   // Here: averaged refinement
@@ -5003,10 +5039,12 @@ FSI_PU_DWR_Problem<dim>::refine_average_with_PU_DWR(
 
   // We perform this loop directly using the kokkos representation to speed up
   // the loop:
+  double fuck_that_shit = 0;
+  int fuck_that_shit_counter = 0;
   {
     // Create a read/write Kokkos view
     auto vector_2d =
-      error_indicators.trilinos_vector()
+      completely_distributed_error_indicators.trilinos_vector()
         .template getLocalView<Kokkos::HostSpace>(Tpetra::Access::ReadWrite);
 
     // Create the 1d Kokkos View
@@ -5014,21 +5052,31 @@ FSI_PU_DWR_Problem<dim>::refine_average_with_PU_DWR(
 
     // Get the length
     const size_t localLength =
-      error_indicators.trilinos_vector().getLocalLength();
+      completely_distributed_error_indicators.trilinos_vector().getLocalLength();
 
     // The acutal loop
     for (size_t k = 0; k < localLength; ++k)
       {
         vector_1d(k) = std::abs(vector_1d(k));
+        fuck_that_shit += vector_1d(k);
+        ++fuck_that_shit_counter;
       }
   }
 
+  double global_fuck_that_shit = 
+    Utilities::MPI::sum(fuck_that_shit, mpi_communicator);
+  int global_fuck_that_shit_counter = 
+    Utilities::MPI::sum(fuck_that_shit_counter, mpi_communicator);
+
+  error_indicator_mean_value = global_fuck_that_shit / global_fuck_that_shit_counter;
+
+  pcout << "error_indicator_mean_value = " << error_indicator_mean_value << std::endl;
 
   const unsigned int                   dofs_per_cell_pou = fe_pou.dofs_per_cell;
   std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell_pou);
 
   // Refining all cells that have values above the mean value
-  double error_indicator_mean_value = error_indicators.mean_value();
+  //double error_indicator_mean_value = error_indicators.mean_value();
 
   double error_ind = 0.0;
   // 1.1; for drag and lift and none mesh smoothing
@@ -5045,14 +5093,18 @@ FSI_PU_DWR_Problem<dim>::refine_average_with_PU_DWR(
 
       for (unsigned int i = 0; i < dofs_per_cell_pou; ++i)
         {
-          //error_ind += error_indicators(local_dof_indices[i]);
+          error_ind += std::abs(error_indicators(local_dof_indices[i]));
         }
+
+      pcout << "On cell: " << cell << ": error_ind = " << error_ind << std::endl;
 
       // For uniform (global) mesh refinement,
       // just comment the following line
       if (error_ind > alpha * error_indicator_mean_value)
         cell->set_refine_flag();
     }
+
+
 
 
   triangulation.execute_coarsening_and_refinement();
@@ -5131,7 +5183,7 @@ FSI_PU_DWR_Problem<dim>::run()
             locally_owned_dofs_primal,
             locally_relevant_dofs_primal,
             mpi_communicator,
-            true);
+            false);
           tmp_solution_primal = solution_primal;
 
           SolutionTransfer<dim, LinearAlgebra::TpetraWrappers::Vector<double>>
