@@ -1214,7 +1214,7 @@ FSI_PU_DWR_Problem<dim>::setup_system_primal()
   const unsigned int n_v = dofs_per_block[0], n_u = dofs_per_block[1],
                      n_p = dofs_per_block[2];
 
-  pcout << "Cells:\t" << triangulation.n_active_cells() << std::endl
+  pcout << "Cells:\t" << triangulation.n_global_active_cells() << std::endl
         << "DoFs (primal):\t" << dof_handler_primal.n_dofs() << " (" << n_v
         << '+' << n_u << '+' << n_p << ')' << std::endl;
 
@@ -5083,6 +5083,8 @@ FSI_PU_DWR_Problem<dim>::refine_average_with_PU_DWR(
   // 5.0; for pressure difference and maximal mesh smoothing
   double alpha = 0.9;
 
+  std::vector<double> global_error_indicator_vector(triangulation.n_global_active_cells());
+
   for (const auto &cell : dof_handler_pou.active_cell_iterators())
     {
       if (!cell->is_locally_owned())
@@ -5096,16 +5098,27 @@ FSI_PU_DWR_Problem<dim>::refine_average_with_PU_DWR(
           error_ind += std::abs(error_indicators(local_dof_indices[i]));
         }
 
-      pcout << "On cell: " << cell << ": error_ind = " << error_ind << std::endl;
+      global_error_indicator_vector[(int)cell->global_active_cell_index()] = error_ind;
+    }
+  
+
+  std::vector<double> communicated_global_error_indicator_vector(triangulation.n_global_active_cells());
+  for (unsigned int i = 0; i < triangulation.n_global_active_cells(); ++i)
+    communicated_global_error_indicator_vector[i] = Utilities::MPI::sum(global_error_indicator_vector[i], mpi_communicator);
+
+  for (const auto &cell : dof_handler_pou.active_cell_iterators())
+    {
+      if (!cell->is_locally_owned())
+        continue;
 
       // For uniform (global) mesh refinement,
       // just comment the following line
-      if (error_ind > alpha * error_indicator_mean_value)
-        cell->set_refine_flag();
+      if (communicated_global_error_indicator_vector[(int)cell->global_active_cell_index()] > alpha * error_indicator_mean_value)
+        {
+          std::cout << "Refine the cell: " << cell->global_active_cell_index() << std::endl;
+          cell->set_refine_flag();
+        }
     }
-
-
-
 
   triangulation.execute_coarsening_and_refinement();
 
