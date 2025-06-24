@@ -1214,7 +1214,7 @@ FSI_PU_DWR_Problem<dim>::setup_system_primal()
   const unsigned int n_v = dofs_per_block[0], n_u = dofs_per_block[1],
                      n_p = dofs_per_block[2];
 
-  pcout << "Cells:\t" << triangulation.n_active_cells() << std::endl
+  pcout << "Cells:\t" << triangulation.n_global_active_cells() << std::endl
         << "DoFs (primal):\t" << dof_handler_primal.n_dofs() << " (" << n_v
         << '+' << n_u << '+' << n_p << ')' << std::endl;
 
@@ -5096,8 +5096,6 @@ FSI_PU_DWR_Problem<dim>::refine_average_with_PU_DWR(
           error_ind += std::abs(error_indicators(local_dof_indices[i]));
         }
 
-      pcout << "On cell: " << cell << ": error_ind = " << error_ind << std::endl;
-
       // For uniform (global) mesh refinement,
       // just comment the following line
       if (error_ind > alpha * error_indicator_mean_value)
@@ -5241,7 +5239,17 @@ FSI_PU_DWR_Problem<dim>::run()
 
               setup_system_adjoint();
 
-              solution_transfer.interpolate(solution_primal);
+
+              {
+                LinearAlgebra::TpetraWrappers::Vector<double> fully_distributed_solution_primal(locally_owned_dofs_primal, mpi_communicator);
+                fully_distributed_solution_primal = solution_primal;
+
+                solution_transfer.interpolate(fully_distributed_solution_primal);
+                pcout << "solution_primal.l2_norm() = " << fully_distributed_solution_primal.l2_norm() << std::endl;
+ 
+                solution_primal = fully_distributed_solution_primal;
+              }
+
             }
 
 
