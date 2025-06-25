@@ -1006,7 +1006,7 @@ FSI_PU_DWR_Problem<dim>::FSI_PU_DWR_Problem(const unsigned int degree)
   : mpi_communicator(MPI_COMM_WORLD)
   , degree(degree)
   ,
-  // triangulation (Triangulation<dim>::maximum_smoothing),
+  // triangulation(mpi_communicator, Triangulation<dim>::maximum_smoothing),
   triangulation(mpi_communicator, Triangulation<dim>::none)
   ,
 
@@ -1285,13 +1285,6 @@ FSI_PU_DWR_Problem<dim>::assemble_matrix_primal()
   // reset the system matrix
   system_matrix_primal.resume_fill();
   system_matrix_primal = 0;
-
-  //// reset the right hand side
-  // system_rhs_primal.reinit(locally_owned_dofs_primal,
-  //                          locally_relevant_dofs_primal,
-  //                          mpi_communicator,
-  //                          true);
-
 
   QGauss<dim>     quadrature_formula(degree + 2);
   QGauss<dim - 1> face_quadrature_formula(degree + 2);
@@ -1737,7 +1730,6 @@ FSI_PU_DWR_Problem<dim>::assemble_matrix_primal()
     }
 
   system_matrix_primal.compress(VectorOperation::add);
-  // system_rhs_primal.compress(VectorOperation::add);
 }
 
 
@@ -2186,6 +2178,10 @@ FSI_PU_DWR_Problem<dim>::set_initial_bc_primal()
                                            boundary_values,
                                            component_mask);
 
+  // To write the correct boundary values into the primal solution vector 
+  // we first create a completely distributed vector. 
+  // We write the boundary values into the completely distributed vector, 
+  // and afterwards we communicate the vector again between the ranks.
   LinearAlgebra::TpetraWrappers::Vector<double>
     completely_distributed_solution_primal(locally_owned_dofs_primal,
                                            locally_relevant_dofs_primal,
@@ -2278,7 +2274,7 @@ FSI_PU_DWR_Problem<dim>::solve_primal()
 
   // create the solver:
   LinearAlgebra::TpetraWrappers::SolverDirect<double>::AdditionalData
-    additional_data("UMFPACK");
+    additional_data("MUMPS");
   LinearAlgebra::TpetraWrappers::SolverDirect<double> A_direct_primal(
     solver_control, additional_data);
 
@@ -2369,9 +2365,7 @@ FSI_PU_DWR_Problem<dim>::newton_iteration_primal()
           break;
         }
 
-      // hey, it works!
       if (newton_residual / old_newton_residual > nonlinear_rho)
-        // if (true)
         {
           assemble_matrix_primal();
           // Only factorize when matrix is re-built
@@ -2394,9 +2388,7 @@ FSI_PU_DWR_Problem<dim>::newton_iteration_primal()
           if (new_newton_residual < newton_residual)
             break;
           else
-            {
-              linearization_point -= newton_update_primal;
-            }
+            linearization_point -= newton_update_primal;
 
           newton_update_primal *= line_search_damping;
         }
@@ -3516,7 +3508,7 @@ FSI_PU_DWR_Problem<dim>::solve_adjoint()
 
   // create the solver:
   LinearAlgebra::TpetraWrappers::SolverDirect<double>::AdditionalData
-    additional_data("UMFPACK");
+    additional_data("MUMPS");
   LinearAlgebra::TpetraWrappers::SolverDirect<double> A_direct_adjoint(
     solver_control, additional_data);
 
@@ -3669,17 +3661,15 @@ FSI_PU_DWR_Problem<dim>::output_results(
   std::string filename_basis;
   filename_basis = "solution_fsi_PU_DWR_";
 
-  std::ostringstream filename;
-
   pcout << "------------------" << std::endl;
   pcout << "Write solution" << std::endl;
   pcout << "------------------" << std::endl;
   pcout << std::endl;
-  filename << filename_basis << Utilities::int_to_string(refinement_cycle, 5)
-           << ".vtk";
 
-  std::ofstream output(filename.str().c_str());
-  data_out.write_vtk(output);
+  unsigned int n_digits = floor(log10(max_no_refinement_cycles) + 1);
+  unsigned int n_ranks  = Utilities::MPI::n_mpi_processes(mpi_communicator);
+  data_out.write_vtu_with_pvtu_record(
+    "./", filename_basis, refinement_cycle, mpi_communicator, n_digits, n_ranks);
 }
 
 // With help of this function, we extract
@@ -4501,19 +4491,8 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
     primal_hanging_node_constraints.close();
   }
 
-  // interpolate requires completely distributed vecors:
-  locally_relevant_dofs_primal =
-    DoFTools::extract_locally_relevant_dofs(dof_handler_primal);
-  LinearAlgebra::TpetraWrappers::Vector<double>
-    completely_distributed_solution_primal(
-      dof_handler_primal.locally_owned_dofs(),
-      locally_relevant_dofs_primal,
-      mpi_communicator,
-      false);
-  completely_distributed_solution_primal = solution_primal;
-
-  locally_relevant_dofs_adjoint =
-    DoFTools::extract_locally_relevant_dofs(dof_handler_adjoint);
+  // Prepare the vector, that will store the primal solution but with 
+  // adjoint length, note that the vector has to be writable.
   LinearAlgebra::TpetraWrappers::Vector<double>
     solution_primal_of_adjoint_length(dof_handler_adjoint.locally_owned_dofs(),
                                       locally_relevant_dofs_adjoint,
@@ -4525,7 +4504,7 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
   // This rescaled primal solution is called
   //   ** solution_primal_of_adjoint_length **
   FETools::interpolate(dof_handler_primal,
-                       completely_distributed_solution_primal,
+                       solution_primal,
                        dof_handler_adjoint,
                        dual_hanging_node_constraints,
                        solution_primal_of_adjoint_length);
@@ -4533,38 +4512,26 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
   // works in sequential, somewhat works in parallel (small error, there seems
   // to be a communication issue)
   solution_primal_of_adjoint_length.compress(VectorOperation::add);
-  pcout << "solution_primal_of_adjoint_length.l2_norm() = "
-        << solution_primal_of_adjoint_length.l2_norm() << std::endl;
 
-
-  LinearAlgebra::TpetraWrappers::Vector<double> solution_adjoint_distributed;
-  solution_adjoint_distributed.reinit(locally_owned_dofs_adjoint,
-                                      locally_relevant_dofs_adjoint,
-                                      mpi_communicator,
-                                      false);
-  solution_adjoint_distributed = solution_adjoint;
-
-
-  // Local vectors of dual weights obtained
-  // from the adjoint solution
-  LinearAlgebra::TpetraWrappers::Vector<double> dual_weights;
-  dual_weights.reinit(locally_owned_dofs_adjoint,
-                      locally_relevant_dofs_adjoint,
-                      mpi_communicator,
-                      true);
+  // Local vectors of dual weights obtained from the adjoint solution
+  // Note: The vector has to be writable!
+  LinearAlgebra::TpetraWrappers::Vector<double> dual_weights(
+    locally_owned_dofs_adjoint,
+    locally_relevant_dofs_adjoint,
+    mpi_communicator,
+    true);
 
   // Main function 2: Execute (z-I_hz) (in the dual space),
   // yielding the adjoint weights for error estimation.
   FETools::interpolation_difference(dof_handler_adjoint,
                                     dual_hanging_node_constraints,
-                                    solution_adjoint_distributed,
+                                    solution_adjoint,
                                     dof_handler_primal,
                                     primal_hanging_node_constraints,
                                     dual_weights);
 
   // works in sequential, return crap in parallel
   dual_weights.compress(VectorOperation::add);
-  pcout << "dual_weights.l2_norm() = " << dual_weights.l2_norm() << std::endl;
 
   // end Block 1
 
@@ -4628,17 +4595,36 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
   solution_primal_of_adjoint_length.compress(VectorOperation::add);
   dual_weights.compress(VectorOperation::add);
 
-  LinearAlgebra::TpetraWrappers::Vector<double>
-    solution_primal_of_adjoint_length_bla(locally_owned_dofs_adjoint,
-                                          locally_relevant_dofs_adjoint,
-                                          mpi_communicator);
-  solution_primal_of_adjoint_length_bla = solution_primal_of_adjoint_length;
 
-  LinearAlgebra::TpetraWrappers::Vector<double> dual_weights_bla(
-    locally_owned_dofs_adjoint,
-    locally_relevant_dofs_adjoint,
-    mpi_communicator);
-  dual_weights_bla = dual_weights;
+  // We need to communicate the vectors solution_primal_of_adjoint_length and dual_weights between 
+  // the processes, so each process can access the locally owned and locally relevent entries.
+  // We keep them inside an extra scope
+  {
+    LinearAlgebra::TpetraWrappers::Vector<double>
+      solution_primal_of_adjoint_length_communicated(locally_owned_dofs_adjoint,
+                                                     locally_relevant_dofs_adjoint,
+                                                     mpi_communicator);
+    solution_primal_of_adjoint_length_communicated = solution_primal_of_adjoint_length;
+
+    solution_primal_of_adjoint_length.reinit(locally_owned_dofs_adjoint,
+                                             locally_relevant_dofs_adjoint,
+                                             mpi_communicator);
+    solution_primal_of_adjoint_length = solution_primal_of_adjoint_length_communicated ;
+  }
+
+  {
+    LinearAlgebra::TpetraWrappers::Vector<double> dual_weights_communicated(
+      locally_owned_dofs_adjoint,
+      locally_relevant_dofs_adjoint,
+      mpi_communicator);
+    dual_weights_communicated = dual_weights;
+
+    dual_weights.reinit(
+      locally_owned_dofs_adjoint,
+      locally_relevant_dofs_adjoint,
+      mpi_communicator);
+    dual_weights = dual_weights_communicated;
+  }
 
   // pcout << "dual_weights_bla.l2_norm() = " << dual_weights_bla.l2_norm() <<
   // std::endl;
@@ -4667,19 +4653,17 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
       // But we use the adjoint FE since we previously enlarged the
       // primal solution to the length of the adjoint vector.
       fe_values_adjoint.get_function_values(
-        solution_primal_of_adjoint_length_bla, primal_cell_values);
+        solution_primal_of_adjoint_length, primal_cell_values);
 
       fe_values_adjoint.get_function_gradients(
-        solution_primal_of_adjoint_length_bla, primal_cell_gradients);
+        solution_primal_of_adjoint_length, primal_cell_gradients);
 
       // adjoint weights
-      fe_values_adjoint.get_function_values(dual_weights_bla,
+      fe_values_adjoint.get_function_values(dual_weights,
                                             dual_weights_values);
 
-      fe_values_adjoint.get_function_gradients(dual_weights_bla,
+      fe_values_adjoint.get_function_gradients(dual_weights,
                                                dual_weights_gradients);
-
-
 
       // Gather local error indicators while running
       // of the degrees of freedom of the partition of unity
@@ -4884,9 +4868,14 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
 
   // Finally, we eliminate and distribute hanging nodes in the error estimator
   AffineConstraints<double> dual_hanging_node_constraints_pou;
-  DoFTools::make_hanging_node_constraints(dof_handler_pou,
-                                          dual_hanging_node_constraints_pou);
-  dual_hanging_node_constraints_pou.close();
+  {
+    dual_hanging_node_constraints_pou.clear();
+    dual_hanging_node_constraints_pou.reinit(locally_owned_dofs_pou,
+                                             locally_relevant_dofs_pou);
+    DoFTools::make_hanging_node_constraints(dof_handler_pou,
+                                            dual_hanging_node_constraints_pou);
+    dual_hanging_node_constraints_pou.close();
+  }
 
   // Distributing the hanging nodes
   dual_hanging_node_constraints_pou.condense(error_indicators);
@@ -4900,14 +4889,15 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
   // end Block 2
 
   {
-    LinearAlgebra::TpetraWrappers::Vector<double> error_indicators_bla(
+    LinearAlgebra::TpetraWrappers::Vector<double> error_indicators_communicated(
       locally_owned_dofs_pou, locally_relevant_dofs_pou, mpi_communicator);
-    error_indicators_bla = error_indicators;
+    error_indicators_communicated = error_indicators;
 
     error_indicators.reinit(locally_owned_dofs_pou,
                             locally_relevant_dofs_pou,
                             mpi_communicator);
-    error_indicators = error_indicators_bla;
+
+    error_indicators = error_indicators_communicated;
   }
 
   // Block 3 (data and terminal print out)
@@ -4916,12 +4906,12 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
   data_out.add_data_vector(error_indicators, "error_ind");
   data_out.build_patches();
 
-  std::ostringstream filename;
-  filename << "solution_error_indicators_" << refinement_cycle << ".vtk"
-           << std::ends;
+  std::string filename_basis = "solution_error_indicators";
 
-  std::ofstream out(filename.str().c_str());
-  data_out.write_vtk(out);
+  unsigned int n_digits = floor(log10(max_no_refinement_cycles) + 1);
+  unsigned int n_ranks  = Utilities::MPI::n_mpi_processes(mpi_communicator);
+  data_out.write_vtu_with_pvtu_record(
+    "./", filename_basis, refinement_cycle, mpi_communicator, n_digits, n_ranks);
 
 
   // Print out on terminal
