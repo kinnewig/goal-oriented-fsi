@@ -4468,6 +4468,7 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
                           locally_relevant_dofs_pou,
                           mpi_communicator,
                           true);
+  error_indicators = 0;
 
   // Implement the interpolation operator
   // (z-z_h)=(z-I_hz)
@@ -4512,6 +4513,7 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
   // works in sequential, somewhat works in parallel (small error, there seems
   // to be a communication issue)
   solution_primal_of_adjoint_length.compress(VectorOperation::add);
+  pcout << "solution_primal_of_adjoint_length.l2_norm() = " << solution_primal_of_adjoint_length.l2_norm() << std::endl; 
 
   // Local vectors of dual weights obtained from the adjoint solution
   // Note: The vector has to be writable!
@@ -4532,6 +4534,7 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
 
   // works in sequential, return crap in parallel
   dual_weights.compress(VectorOperation::add);
+  pcout << "dual_weights.l2_norm() = " << dual_weights.l2_norm() << std::endl;
 
   // end Block 1
 
@@ -4589,8 +4592,6 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
 
   const Tensor<2, dim> Identity = ALE_Transformations ::get_Identity<dim>();
 
-  typename DoFHandler<dim>::active_cell_iterator cell_adjoint =
-    dof_handler_adjoint.begin_active();
 
   solution_primal_of_adjoint_length.compress(VectorOperation::add);
   dual_weights.compress(VectorOperation::add);
@@ -4626,15 +4627,11 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
     dual_weights = dual_weights_communicated;
   }
 
-  // pcout << "dual_weights_bla.l2_norm() = " << dual_weights_bla.l2_norm() <<
-  // std::endl;
+  typename DoFHandler<dim>::active_cell_iterator cell_adjoint =
+    dof_handler_adjoint.begin_active();
 
   for (const auto &cell : dof_handler_pou.active_cell_iterators())
     {
-      if ((cell->is_locally_owned() && !cell_adjoint->is_locally_owned()) ||
-          (!cell->is_locally_owned() && cell_adjoint->is_locally_owned()))
-        std::cout << "This should not be happening!" << std::endl;
-
       if (!cell->is_locally_owned() || !cell_adjoint->is_locally_owned())
         {
           // update adjoint cell iterator
@@ -4854,7 +4851,7 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
         } // end q_points
 
 
-      // Write all error contributions
+     // Write all error contributions
       // in their respective places in the global error vector.
       cell->get_dof_indices(local_dof_indices);
       for (unsigned int i = 0; i < dofs_per_cell; ++i)
@@ -4865,6 +4862,8 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
 
     } // end cell loop for PU FE elements
 
+  error_indicators.compress(VectorOperation::add);
+  pcout << "error_indicators.l2_norm() = " << error_indicators.l2_norm() << " (Point 1)" << std::endl;
 
   // Finally, we eliminate and distribute hanging nodes in the error estimator
   AffineConstraints<double> dual_hanging_node_constraints_pou;
@@ -4881,14 +4880,14 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
   dual_hanging_node_constraints_pou.condense(error_indicators);
 
   // Averaging (making the 'solution' continuous)
-  error_indicators.compress(VectorOperation::add);
   dual_hanging_node_constraints_pou.distribute(error_indicators);
 
-  pcout << "error_indicators.l2_norm() = " << error_indicators.l2_norm()
+  error_indicators.compress(VectorOperation::add);
+  pcout << "error_indicators.l2_norm() = " << error_indicators.l2_norm() << " (Point 2)"
         << std::endl;
   // end Block 2
 
-  {
+  { // TODO? Is this necessary?
     LinearAlgebra::TpetraWrappers::Vector<double> error_indicators_communicated(
       locally_owned_dofs_pou, locally_relevant_dofs_pou, mpi_communicator);
     error_indicators_communicated = error_indicators;
