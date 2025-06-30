@@ -4564,7 +4564,8 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
   const unsigned int dofs_per_cell = fe_values_pou.dofs_per_cell;
   const unsigned int n_q_points    = fe_values_pou.n_quadrature_points;
 
-  Vector<double> local_err_ind(dofs_per_cell);
+  Vector<double>     local_err_ind(dofs_per_cell);
+  FullMatrix<double> local_err_matrix(dofs_per_cell, dofs_per_cell);
 
   std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
 
@@ -4627,6 +4628,39 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
     dual_weights = dual_weights_communicated;
   }
 
+  // Prepare the constraints of the dual problem
+  AffineConstraints<double> dual_hanging_node_constraints_pou;
+  {
+    dual_hanging_node_constraints_pou.clear();
+    dual_hanging_node_constraints_pou.reinit(locally_owned_dofs_pou,
+                                             locally_relevant_dofs_pou);
+    DoFTools::make_hanging_node_constraints(dof_handler_pou,
+                                            dual_hanging_node_constraints_pou);
+    dual_hanging_node_constraints_pou.close();
+  }
+
+  // TODO: Workarround, as there is a bug in the distribute function, we need to create a dummy vector
+  LinearAlgebra::TpetraWrappers::SparseMatrix<double> dual_weight_dummy_matrix;
+  {
+    DynamicSparsityPattern dsp_pou(locally_relevant_dofs_pou);
+
+    DoFTools::make_sparsity_pattern(dof_handler_pou,
+                                    dsp_pou,
+                                    dual_hanging_node_constraints_pou,
+                                    false);
+
+    SparsityTools::distribute_sparsity_pattern(
+      dsp_pou,
+      dof_handler_pou.locally_owned_dofs(),
+      mpi_communicator,
+      locally_relevant_dofs_pou);
+
+    dual_weight_dummy_matrix.reinit(locally_owned_dofs_pou,
+                                    locally_owned_dofs_pou,
+                                    dsp_pou,
+                                    mpi_communicator);
+  }
+
   typename DoFHandler<dim>::active_cell_iterator cell_adjoint =
     dof_handler_adjoint.begin_active();
 
@@ -4643,7 +4677,8 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
       fe_values_pou.reinit(cell);
       fe_values_adjoint.reinit(cell_adjoint);
 
-      local_err_ind = 0;
+      local_err_ind    = 0;
+      local_err_matrix = 0;
 
 
       // primal solution (cell residuals)
@@ -4851,36 +4886,32 @@ FSI_PU_DWR_Problem<dim>::compute_error_indicators_a_la_PU_DWR(
         } // end q_points
 
 
-     // Write all error contributions
+      // Write all error contributions
       // in their respective places in the global error vector.
       cell->get_dof_indices(local_dof_indices);
-      for (unsigned int i = 0; i < dofs_per_cell; ++i)
-        error_indicators(local_dof_indices[i]) += local_err_ind(i);
+      //for (unsigned int i = 0; i < dofs_per_cell; ++i)
+      //  error_indicators(local_dof_indices[i]) += local_err_ind(i);
+      dual_hanging_node_constraints_pou.distribute_local_to_global(
+          local_err_matrix, 
+          local_err_ind, 
+          local_dof_indices, 
+          dual_weight_dummy_matrix, 
+          error_indicators);
 
       // update adjoint cell iterator
       ++cell_adjoint;
 
     } // end cell loop for PU FE elements
 
-  error_indicators.compress(VectorOperation::add);
-  pcout << "error_indicators.l2_norm() = " << error_indicators.l2_norm() << " (Point 1)" << std::endl;
-
+  // TODO: The following functions seem not to work!!!
+  // {
   // Finally, we eliminate and distribute hanging nodes in the error estimator
-  AffineConstraints<double> dual_hanging_node_constraints_pou;
-  {
-    dual_hanging_node_constraints_pou.clear();
-    dual_hanging_node_constraints_pou.reinit(locally_owned_dofs_pou,
-                                             locally_relevant_dofs_pou);
-    DoFTools::make_hanging_node_constraints(dof_handler_pou,
-                                            dual_hanging_node_constraints_pou);
-    dual_hanging_node_constraints_pou.close();
-  }
-
   // Distributing the hanging nodes
-  dual_hanging_node_constraints_pou.condense(error_indicators);
+  //dual_hanging_node_constraints_pou.condense(error_indicators);
 
   // Averaging (making the 'solution' continuous)
-  dual_hanging_node_constraints_pou.distribute(error_indicators);
+  //dual_hanging_node_constraints_pou.distribute(error_indicators);
+  // }
 
   error_indicators.compress(VectorOperation::add);
   pcout << "error_indicators.l2_norm() = " << error_indicators.l2_norm() << " (Point 2)"
