@@ -2190,9 +2190,15 @@ FSI_PU_DWR_Problem<dim>::set_initial_bc_primal()
 
   completely_distributed_solution_primal = solution_primal;
 
+  // Only modify the locally owned entries, therefore we need the local range:
+  const std::pair<types::global_dof_index, types::global_dof_index>
+    local_range = completely_distributed_solution_primal.local_range();
+
   for (auto &boundary_value : boundary_values)
-    completely_distributed_solution_primal(boundary_value.first) =
-      boundary_value.second;
+    if ((boundary_value.first >= local_range.first) &&
+        (boundary_value.first < local_range.second))
+      completely_distributed_solution_primal(boundary_value.first) =
+        boundary_value.second;
 
   completely_distributed_solution_primal.compress(VectorOperation::add);
 
