@@ -111,6 +111,7 @@
 #include <deal.II/lac/affine_constraints.templates.h>
 #include <deal.II/lac/precondition.h>
 #include <deal.II/lac/solver_cg.h>
+#include <deal.II/lac/solver_gmres.h>
 
 #include <deal.II/numerics/data_out.h>
 #include <deal.II/numerics/matrix_tools.h>
@@ -124,6 +125,9 @@
 #include <deal.II/lac/trilinos_tpetra_sparse_matrix.h>
 #include <deal.II/lac/trilinos_tpetra_vector.h>
 #include <deal.II/lac/vector_operation.h>
+
+// Schwarz Preconditioner
+#include <deal.II/lac/trilinos_tpetra_precondition.h>
 
 // C++
 #include <fstream>
@@ -2277,17 +2281,22 @@ FSI_PU_DWR_Problem<dim>::solve_primal()
 
   // create the solver_control object
   SolverControl solver_control(dof_handler_primal.n_dofs(), 1e-12);
+  SolverGMRES<LinearAlgebra::TpetraWrappers::Vector<double, MemorySpace::Host>> solver(solver_control);
 
-  // create the solver:
-  LinearAlgebra::TpetraWrappers::SolverDirect<double>::AdditionalData
-    additional_data("MUMPS");
-  LinearAlgebra::TpetraWrappers::SolverDirect<double> A_direct_primal(
-    solver_control, additional_data);
-
-  A_direct_primal.initialize(system_matrix_primal);
+  // create the preconditioner object
+  system_matrix_primal.compress(VectorOperation::add);
+  LinearAlgebra::TpetraWrappers::PreconditionFROSch<double> preconditioner_primal("one_level");
+  Teuchos::RCP<Teuchos::ParameterList> parameter_list = Teuchos::getParametersFromXmlFile("step-fsi.xml");
+  Teuchos::RCP<Teuchos::ParameterList> prm_preconditioner_list = Teuchos::sublist(parameter_list, "Preconditioner List");
+  preconditioner_primal.initialize(system_matrix_primal, prm_preconditioner_list);
 
   // Solve
-  A_direct_primal.solve(newton_update_primal, system_rhs_primal);
+  solver.solve(system_matrix_primal,
+               newton_update_primal,
+               system_rhs_primal,
+               preconditioner_primal);
+
+  pcout << "Solved primal in " << solver_control.last_step() << std::endl;
 
   newton_update_primal.compress(VectorOperation::add);
   constraints_primal.distribute(newton_update_primal);
@@ -3511,23 +3520,28 @@ FSI_PU_DWR_Problem<dim>::solve_adjoint()
 
   // create the solver_control object
   SolverControl solver_control(dof_handler_primal.n_dofs(), 1e-12);
+  SolverGMRES<LinearAlgebra::TpetraWrappers::Vector<double, MemorySpace::Host>> solver(solver_control);
 
-  // create the solver:
-  LinearAlgebra::TpetraWrappers::SolverDirect<double>::AdditionalData
-    additional_data("MUMPS");
-  LinearAlgebra::TpetraWrappers::SolverDirect<double> A_direct_adjoint(
-    solver_control, additional_data);
+  // create the preconditioner object
+  system_matrix_adjoint.compress(VectorOperation::add);
+  LinearAlgebra::TpetraWrappers::PreconditionFROSch<double> preconditioner_adjoint("one_level");
+  Teuchos::RCP<Teuchos::ParameterList> parameter_list = Teuchos::getParametersFromXmlFile("step-fsi.xml");
+  Teuchos::RCP<Teuchos::ParameterList> prm_preconditioner_list = Teuchos::sublist(parameter_list, "Preconditioner List");
+  preconditioner_adjoint.initialize(system_matrix_adjoint, prm_preconditioner_list);
+
 
   // Create a ditributed vector to store the solution:
   LinearAlgebra::TpetraWrappers::Vector<double>
     completely_distributed_solution_adjoint(locally_owned_dofs_adjoint,
                                             mpi_communicator);
 
-  A_direct_adjoint.initialize(system_matrix_adjoint);
-
   // Solve
-  A_direct_adjoint.solve(completely_distributed_solution_adjoint,
-                         system_rhs_adjoint);
+  solver.solve(system_matrix_adjoint,
+               completely_distributed_solution_adjoint,
+               system_rhs_adjoint,
+               preconditioner_adjoint);
+
+  pcout << "Solved adjoint in " << solver_control.last_step() << std::endl;
 
   // Reset the timer
   timer_solve_adjoint.stop();

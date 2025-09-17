@@ -1,0 +1,72 @@
+<ParameterList name="Step-FSI">
+  <ParameterList name="Mesh and Geometry">
+    <Parameter name="Grid file name"                  type="string" value="fsi.inp"/>
+    <Parameter name="Number of refinements"           type="int"    value="1"/>
+    <Parameter name="Polynomial degree"               type="int"    value="2"/>
+  </ParameterList>
+  <ParameterList name="Physical constants"> 
+    <!-- Fluid parameters -->
+    <Parameter name="density fluid"                   type="double" value="1.0e+3"/>
+    <Parameter name="viscosity"                       type="double" value="1.0e-3"/>
+    <!-- Solid parameters -->
+    <!-- # FSI 1 & 3: 1.0e+3; FSI 2: 1.0e+4 -->
+    <Parameter name="density structure"               type="double" value="1.0e+3"/>
+    <!-- # FSI 1 & 2: 0.5e+6; FSI 3: 2.0e+6 -->
+    <Parameter name="lame coefficient mu"             type="double" value="0.5e+6"/>
+    <Parameter name="poisson ratio nu"                type="double" value="0.4"/>
+    <Parameter name="force structure x"               type="double" value="0.0"/>
+    <Parameter name="force structure y"               type="double" value="0.0"/>
+    <!-- Mesh motion control parameter -->
+    <Parameter name="alpha u"                         type="double" value="1.0e-8"/>
+    <!-- TODO: alpha press stab needs to be calibrated -->
+    <Parameter name="alpha press stab"                type="double" value="0.02"/>
+    <Parameter name="inflow velocity"                 type="double" value="0.2"/>
+  </ParameterList>
+  <ParameterList name="Timestepping schemes">
+    <!-- FSI 1 BE; FSI 2&3 CN or CN_shifted -->
+    <Parameter name="time stepping scheme"            type="string" value="BE"/>
+    <!-- FSI 1: 1.0 (quasi-stationary) -->
+    <!-- FSI 2: <= 1.0e-2 (non-stationary) -->
+    <!-- FSI 3: <= 1.0e-3 (non-stationary) -->
+    <Parameter name="timestep"                        type="double" value="1.0"/>
+    <!-- FSI 1: 25 , T= 25   (timestep == 1.0) -->
+    <!-- FSI 2: 1500, T= 15  (timestep == 1.0e-2) -->
+    <!-- FSI 3: 10000, T= 10 (timestep == 1.0e-3) -->
+    <Parameter name="max no timesteps"                type="int"    value="25"/>
+  </ParameterList>
+  <ParameterList name="Output Parameters">
+    <Parameter name="Output File"                     type="string" value="solution"/>
+  </ParameterList>
+  <ParameterList name="Preconditioner List">
+    <Parameter name="OverlappingOperator Type"         type="string" value="AlgebraicOverlappingOperator"/>
+    <Parameter name="CoarseOperator Type"              type="string" value="IPOUHarmonicCoarseOperator"/>
+    <Parameter name="Dimension"                        type="int"    value="2"/>
+    <Parameter name="Overlap"                          type="int"    value="3"/>
+    <ParameterList name="AlgebraicOverlappingOperator">
+      <Parameter name="Combine Values in Overlap"    type="string" value="Restricted"/>
+      <ParameterList name="Solver">
+        <Parameter name="SolverType"               type="string" value="Amesos2"/>
+        <Parameter name="Solver"                   type="string" value="Umfpack"/>
+      </ParameterList>
+    </ParameterList>
+    <ParameterList name="IPOUHarmonicCoarseOperator">
+      <ParameterList name="Blocks">
+        <ParameterList name="1">
+          <Parameter name="Use For Coarse Space" type="bool"   value="true"/>
+          <ParameterList name="InterfacePartitionOfUnity">
+            <Parameter name="Type"             type="string" value="GDSW"/>
+          </ParameterList>
+        </ParameterList>
+      </ParameterList>
+      <ParameterList name="ExtensionSolver">
+        <Parameter name="SolverType"               type="string" value="Amesos2"/>
+        <Parameter name="Solver"                   type="string" value="Umfpack"/>
+      </ParameterList>
+      <ParameterList name="CoarseSolver">
+        <Parameter name="SolverType"               type="string" value="Amesos2"/>
+        <Parameter name="Solver"                   type="string" value="Umfpack"/>
+      </ParameterList>
+    </ParameterList>
+  </ParameterList>
+</ParameterList>
+
