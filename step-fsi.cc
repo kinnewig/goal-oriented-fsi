@@ -127,7 +127,7 @@
 #include <deal.II/lac/vector_operation.h>
 
 // Schwarz Preconditioner
-#include <deal.II/lac/trilinos_tpetra_precondition.h>
+//#include <deal.II/lac/trilinos_tpetra_precondition.h>
 #include <deal.II/lac/trilinos_tpetra_precondition_frosch.templates.h>
 
 // C++
@@ -963,6 +963,8 @@ private:
 
   // Preconditioner
   LinearAlgebra::TpetraWrappers::PreconditionFROSch<double> preconditioner_primal;
+  int overlap_primal;
+  int overlap_adjoint;
 
   // Prallel output
   ConditionalOStream pcout;
@@ -1045,7 +1047,9 @@ FSI_PU_DWR_Problem<dim>::FSI_PU_DWR_Problem(const unsigned int degree)
   // https://www.sciencedirect.com/science/article/pii/S0377042714004798
   fe_pou(FE_Q<dim>(1), 1)
   , dof_handler_pou(triangulation)
-  , preconditioner_primal("one_level")
+  , preconditioner_primal("One Level")
+  , overlap_primal(5)
+  , overlap_adjoint(20)
   , pcout(std::cout, (Utilities::MPI::this_mpi_process(mpi_communicator) == 0))
   , timer(mpi_communicator, pcout, TimerOutput::summary, TimerOutput::cpu_times)
 {}
@@ -1072,7 +1076,7 @@ FSI_PU_DWR_Problem<dim>::set_runtime_parameters()
   test_case = "FSI_1";
   // pressure, drag, lift, displacement
   adjoint_rhs               = "drag";
-  max_no_refinement_cycles  = 4;
+  max_no_refinement_cycles  = 8;
   max_no_degrees_of_freedom = 2.0e+6;
   TOL_DWR_estimator         = 1.0e-5;
 
@@ -2386,10 +2390,12 @@ FSI_PU_DWR_Problem<dim>::newton_iteration_primal()
           assemble_matrix_primal();
 
           // create the preconditioner object
-          Teuchos::RCP<Teuchos::ParameterList> parameter_list = Teuchos::getParametersFromXmlFile("step-fsi.xml");
-          Teuchos::RCP<Teuchos::ParameterList> prm_preconditioner_list = Teuchos::sublist(parameter_list, "Preconditioner List");
           system_matrix_primal.compress(VectorOperation::add);
-          preconditioner_primal.initialize(system_matrix_primal, dof_handler_primal, triangulation, mpi_communicator, prm_preconditioner_list, 5);
+  
+          // Set the overlap, for all other values we can use the default.
+          LinearAlgebra::TpetraWrappers::PreconditionFROSch<double>::AdditionalData data(overlap_primal, 2, "Restricted", "KLU");
+
+          preconditioner_primal.initialize(system_matrix_primal, dof_handler_primal, data);
         }
 
       // Solve Ax = b
@@ -3529,10 +3535,12 @@ FSI_PU_DWR_Problem<dim>::solve_adjoint()
 
   // create the preconditioner object
   system_matrix_adjoint.compress(VectorOperation::add);
-  LinearAlgebra::TpetraWrappers::PreconditionFROSch<double> preconditioner_adjoint("one_level");
-  Teuchos::RCP<Teuchos::ParameterList> parameter_list = Teuchos::getParametersFromXmlFile("step-fsi.xml");
-  Teuchos::RCP<Teuchos::ParameterList> prm_preconditioner_list = Teuchos::sublist(parameter_list, "Preconditioner List");
-  preconditioner_adjoint.initialize(system_matrix_adjoint, dof_handler_adjoint, triangulation, mpi_communicator, prm_preconditioner_list, 10);
+  LinearAlgebra::TpetraWrappers::PreconditionFROSch<double> preconditioner_adjoint("One Level");
+
+  // Set the overlap, for all other values we can use the default.
+  LinearAlgebra::TpetraWrappers::PreconditionFROSch<double>::AdditionalData data(overlap_adjoint, 2, "Restricted", "KLU");
+
+  preconditioner_adjoint.initialize(system_matrix_adjoint, dof_handler_adjoint, data);
 
   // Create a ditributed vector to store the solution:
   LinearAlgebra::TpetraWrappers::Vector<double>
@@ -3910,8 +3918,8 @@ FSI_PU_DWR_Problem<dim>::compute_drag_lift_fsi_fluid_tensor()
     }
   else if (test_case == "FSI_1")
     {
-      reference_value_drag = 1.5370185576528707e+01;
-      reference_value_lift = 7.4118844385273164e-01;
+      reference_value_drag = 1.5361224070062779e+01; // DWR Level 8
+      reference_value_lift = 7.3909985148010859e-01; // DWR Level 8
     }
 
 
@@ -5296,7 +5304,8 @@ FSI_PU_DWR_Problem<dim>::run()
 
             }
 
-
+            overlap_adjoint += 2;
+            overlap_primal += 1;
         } // end mesh refinement
 
     } // end refinement cycles
