@@ -70,34 +70,21 @@
 // the functionality of these
 // deal.II library files and some C++ header
 // files.
+#include <deal.II/base/conditional_ostream.h>
 #include <deal.II/base/function.h>
-#include <deal.II/base/logstream.h>
+#include <deal.II/base/index_set.h>
 #include <deal.II/base/quadrature_lib.h>
 #include <deal.II/base/timer.h>
 #include <deal.II/base/utilities.h>
 
-#include <deal.II/grid/grid_generator.h>
-#include <deal.II/grid/tria.h>
-#include <deal.II/grid/tria_accessor.h>
-#include <deal.II/grid/tria_iterator.h>
+#include <deal.II/distributed/grid_refinement.h>
+#include <deal.II/distributed/shared_tria.h>
 
-#include <deal.II/lac/block_sparse_matrix.h>
-#include <deal.II/lac/block_vector.h>
-#include <deal.II/lac/full_matrix.h>
-#include <deal.II/lac/sparse_direct.h>
-// #include <deal.II/grid/tria_boundary_lib.h>
-#include <deal.II/grid/grid_in.h>
-#include <deal.II/grid/grid_tools.h>
-// From deal.II 9.x.x
 #include <deal.II/dofs/dof_accessor.h>
 #include <deal.II/dofs/dof_handler.h>
 #include <deal.II/dofs/dof_renumbering.h>
 #include <deal.II/dofs/dof_tools.h>
 
-#include <deal.II/grid/manifold_lib.h>
-
-
-// #include <deal.II/lac/constraint_matrix.h>
 #include <deal.II/fe/fe_dgp.h>
 #include <deal.II/fe/fe_dgq.h>
 #include <deal.II/fe/fe_q.h>
@@ -107,28 +94,27 @@
 #include <deal.II/fe/fe_values.h>
 #include <deal.II/fe/mapping_q1.h>
 
+#include <deal.II/grid/grid_generator.h>
+#include <deal.II/grid/grid_in.h>
+#include <deal.II/grid/grid_tools.h>
+#include <deal.II/grid/manifold_lib.h>
+
 #include <deal.II/lac/affine_constraints.h>
 #include <deal.II/lac/affine_constraints.templates.h>
-#include <deal.II/lac/precondition.h>
-#include <deal.II/lac/solver_cg.h>
+#include <deal.II/lac/dynamic_sparsity_pattern.h>
+#include <deal.II/lac/full_matrix.h>
+#include <deal.II/lac/sparsity_tools.h>
 #include <deal.II/lac/solver_gmres.h>
+#include <deal.II/lac/trilinos_tpetra_sparse_matrix.h>
+#include <deal.II/lac/trilinos_tpetra_vector.h>
+#include <deal.II/lac/trilinos_tpetra_precondition.h>
+#include <deal.II/lac/trilinos_tpetra_precondition_frosch.templates.h>
+#include <deal.II/lac/vector.h>
 
 #include <deal.II/numerics/data_out.h>
 #include <deal.II/numerics/matrix_tools.h>
 #include <deal.II/numerics/solution_transfer.h>
 #include <deal.II/numerics/vector_tools.h>
-
-// Trilinos Tpetra SparseMatrix and Vector
-#include <deal.II/lac/trilinos_tpetra_block_sparse_matrix.h>
-#include <deal.II/lac/trilinos_tpetra_block_vector.h>
-#include <deal.II/lac/trilinos_tpetra_solver_direct.h>
-#include <deal.II/lac/trilinos_tpetra_sparse_matrix.h>
-#include <deal.II/lac/trilinos_tpetra_vector.h>
-#include <deal.II/lac/vector_operation.h>
-
-// Schwarz Preconditioner
-//#include <deal.II/lac/trilinos_tpetra_precondition.h>
-#include <deal.II/lac/trilinos_tpetra_precondition_frosch.templates.h>
 
 // C++
 #include <fstream>
@@ -1047,7 +1033,7 @@ FSI_PU_DWR_Problem<dim>::FSI_PU_DWR_Problem(const unsigned int degree)
   // https://www.sciencedirect.com/science/article/pii/S0377042714004798
   fe_pou(FE_Q<dim>(1), 1)
   , dof_handler_pou(triangulation)
-  , preconditioner_primal("One Level")
+  , preconditioner_primal(LinearAlgebra::TpetraWrappers::PreconditionFROSch<double>::OneLevel)
   , overlap_primal(5)
   , overlap_adjoint(20)
   , pcout(std::cout, (Utilities::MPI::this_mpi_process(mpi_communicator) == 0))
@@ -2393,7 +2379,7 @@ FSI_PU_DWR_Problem<dim>::newton_iteration_primal()
           system_matrix_primal.compress(VectorOperation::add);
   
           // Set the overlap, for all other values we can use the default.
-          LinearAlgebra::TpetraWrappers::PreconditionFROSch<double>::AdditionalData data(overlap_primal, 2, "Restricted", "KLU");
+          LinearAlgebra::TpetraWrappers::PreconditionFROSch<double>::AdditionalData data(overlap_primal, 2, LinearAlgebra::TpetraWrappers::PreconditionFROSch<double>::Restricted, LinearAlgebra::TpetraWrappers::PreconditionFROSch<double>::KLU);
 
           preconditioner_primal.initialize(system_matrix_primal, dof_handler_primal, data);
         }
@@ -3535,10 +3521,10 @@ FSI_PU_DWR_Problem<dim>::solve_adjoint()
 
   // create the preconditioner object
   system_matrix_adjoint.compress(VectorOperation::add);
-  LinearAlgebra::TpetraWrappers::PreconditionFROSch<double> preconditioner_adjoint("One Level");
+  LinearAlgebra::TpetraWrappers::PreconditionFROSch<double> preconditioner_adjoint(LinearAlgebra::TpetraWrappers::PreconditionFROSch<double>::OneLevel);
 
   // Set the overlap, for all other values we can use the default.
-  LinearAlgebra::TpetraWrappers::PreconditionFROSch<double>::AdditionalData data(overlap_adjoint, 2, "Restricted", "KLU");
+  LinearAlgebra::TpetraWrappers::PreconditionFROSch<double>::AdditionalData data(overlap_adjoint, 2, LinearAlgebra::TpetraWrappers::PreconditionFROSch<double>::Restricted, LinearAlgebra::TpetraWrappers::PreconditionFROSch<double>::KLU);
 
   preconditioner_adjoint.initialize(system_matrix_adjoint, dof_handler_adjoint, data);
 
